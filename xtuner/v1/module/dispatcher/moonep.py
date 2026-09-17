@@ -21,7 +21,21 @@ from torch import nn
 from torch.distributed.tensor import DTensor
 from typing_extensions import TypedDict, override
 
-from xtuner.v1.ops.moe.cuda.route_weight import route_weight_rows_backward
+# ★ Ascend: route_weight_rows_backward NPU branch (pure PyTorch, no Triton).
+# GPU path uses a Triton kernel; NPU uses an equivalent torch implementation.
+# ★★ 必须按设备分流而非 import 成败: cuda.route_weight 的 import 永远成功,
+#     Triton kernel 只在首次调用时加载 libcuda — NPU 上 import 能过但调用即崩。
+try:
+    import torch.npu  # noqa: F401  (torch_npu 注入 npu 后端后此属性存在)
+
+    _ON_NPU = True
+except (ImportError, AttributeError):
+    _ON_NPU = False
+
+if _ON_NPU:
+    from xtuner.v1.ops.moe.npu.route_weight import route_weight_rows_backward
+else:
+    from xtuner.v1.ops.moe.cuda.route_weight import route_weight_rows_backward
 from xtuner.v1.utils import log_rank0
 
 from .base import ExpertWeightLayout, GenericDispatcher, PostDispatchResult, ProjectionPair
@@ -32,13 +46,14 @@ from .fsdp_vmm_landing import (
     uninstall_fsdp_vmm_landing,
 )
 from .moonep_workspace import _ExpertVMMWorkspace
+from .moonep_ascend_workspace import _ExpertAscendWorkspace
 
 
 _INTEGRATION_API_VERSION = 3
 _MOONEP_IMPORT_ERROR: ImportError | None
 
 try:
-    import moonep as _moonep_backend
+    import moonep_ascend as _moonep_backend
 except ImportError as exc:
     _moonep_backend = None
     _MOONEP_IMPORT_ERROR = exc
@@ -90,15 +105,27 @@ class _MoonEPResources:
     experts_per_rank: int
     top_k: int
     hidden_size: int
+    intermediate_size: int
     gradient_slots: int
     num_sms: int
+    ip_port: str
     _buffer_box: list
 
     def buffer_for(self, tokens_per_rank: int) -> Any:
         """Dispatch entry: build the Fixed-S Buffer once, then check S."""
         if not self._buffer_box:
             assert _moonep_backend is not None
-            buffer = _moonep_backend.Buffer(
+            # ★ 每个 EP 组用独立 SHMEM bootstrap 端口。组 ID = 本组 root 的全局
+            # rank (dist.get_global_rank(ep_group, 0)) — 组内所有 rank 算出同一值,
+            # 不同组不同值。不能用 dist.get_rank(ep_group) (那是组内 rank 0..R-1,
+            # 同组不同 rank 会算出不同端口 → client 连错 server)。
+            # DeviceMesh EP 维跨节点交错 → 多组 root 同在 master, 端口必须错开。
+            group_root_global_rank = dist.get_global_rank(self.ep_group, 0)
+            base_port = int(self.ip_port.rsplit(':', 1)[-1])
+            host = self.ip_port.rsplit(':', 1)[0]
+            shmem_port = base_port + group_root_global_rank
+            shmem_ip_port = f"{host}:{shmem_port}"
+            buffer = _moonep_backend.BufferXtuner(
                 S=tokens_per_rank,
                 H=self.hidden_size,
                 K=self.top_k,
@@ -107,7 +134,15 @@ class _MoonEPResources:
                 group=self.ep_group,
                 explicitly_destroy=True,
                 num_sms=self.num_sms,
+                ip_port=shmem_ip_port,
+                ffn_hidden_size=self.intermediate_size,
+                gradient_slots=self.gradient_slots,
             )
+            # ★ Ascend: fill the deferred workspace layout from BufferXtuner's
+            # symmetric heap views (xt_*_view). GPU path builds layout in
+            # install_after_fsdp via VMM; Ascend defers to here (post-buffer).
+            if hasattr(self.workspace, 'build_from_buffer'):
+                self.workspace.build_from_buffer(buffer, self.gradient_slots)
             self._buffer_box.append((buffer, tokens_per_rank))
         buffer, fixed_s = self._buffer_box[0]
         if tokens_per_rank != fixed_s:
@@ -272,6 +307,7 @@ class MoonEPModelRuntime:
         intra_layer_micro_batch: int,
         staging_reference: bool,
         num_sms: int = 64,
+        ip_port: str = "tcp://127.0.0.1:8766",
     ) -> None:
         # Config-level capability validation (backend version, EP geometry,
         # dtype, grouped-GEMM backend, ...) lives in ``moonep_capability`` and
@@ -286,6 +322,7 @@ class MoonEPModelRuntime:
         self._top_k = top_k
         self._num_sms = num_sms
         self._gradient_slots = intra_layer_micro_batch
+        self._ip_port = ip_port
         self._landing = build_landing_adapter(staging_reference)
 
         # Physical routed layers in registration (construction) order.
@@ -329,7 +366,11 @@ class MoonEPModelRuntime:
                 f"MoonEP registration order does not match FSDP execution order: {registered} != {execution_order}"
             )
 
-        workspace = _ExpertVMMWorkspace.allocate(
+        # ★ DIAG: trace install_after_fsdp step by step
+        def _diag(msg):
+            pass  # (排查期诊断打印已移除, 保留签名以最小化 diff)
+
+        workspace = _ExpertAscendWorkspace.allocate(
             projection_shapes=(
                 (2 * self._intermediate_size, self._hidden_size),
                 (self._hidden_size, self._intermediate_size),
@@ -338,11 +379,14 @@ class MoonEPModelRuntime:
             ep_group=self._ep_group,
             gradient_slots=self._gradient_slots,
             home_generations=2,
+            buffer=None,  # ★ Ascend: workspace built lazily in buffer_for
         )
+
         # Keep MoonEP collectives in FSDP's device-side launch order. A
         # separate high-priority stream forms an orthogonal progress wave with
         # NCCL and stalls at MoonEP's rank barriers under a full model.
         comm_stream = torch.cuda.current_stream()
+
         try:
             self._landing.install(fsdp_root=fsdp_root, workspace=workspace, layers=tuple(self._layers))
         except Exception:
@@ -357,8 +401,10 @@ class MoonEPModelRuntime:
             experts_per_rank=self._num_experts // self._ep_group.size(),
             top_k=self._top_k,
             hidden_size=self._hidden_size,
+            intermediate_size=self._intermediate_size,
             gradient_slots=self._gradient_slots,
             num_sms=self._num_sms,
+            ip_port=self._ip_port,
             _buffer_box=[],
         )
 
@@ -675,7 +721,10 @@ def combine_backward(state: _MoonEPLayerCallState, grad_output: torch.Tensor) ->
             async_finish=False,
             zero_copy=False,
         )
-        assert no_weights is None and no_cu is None and reused_plan is state.plan
+        # ★ Ascend buffer.dispatch 无条件返回 cu_seqlens (plan 的视图, 非 None),
+        #   权重在 plan 复用模式下也不产出 — 断言只锁 plan 身份 (数据面正确性:
+        #   grad_weighted 按 state.plan 的 dst 打包, 复用同一 plan 即正确)。
+        assert no_weights is None and reused_plan is state.plan
         gradient_dispatch_done = torch.cuda.current_stream().record_event()
         resources.workspace.prefetch_weights(buffer=buffer, plan=state.plan, generation=state.generation)
         return grad_weighted, gradient_dispatch_done

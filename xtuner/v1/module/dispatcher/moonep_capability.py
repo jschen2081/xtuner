@@ -32,8 +32,8 @@ def check_config(config: Any) -> None:
         raise ValueError("MoonEP currently requires BF16 expert compute; FP8 is not supported")
     if config.ep_size <= 1:
         raise ValueError("MoonEP requires expert parallelism")
-    if config.ep_size not in (2, 4, 8):
-        raise ValueError("MoonEP requires ep_size in {2, 4, 8}")
+    if config.ep_size not in (2, 4, 8, 16, 32):
+        raise ValueError("MoonEP requires ep_size in {2, 4, 8, 16, 32}")
     if config.n_routed_experts % config.ep_size:
         raise ValueError("MoonEP requires n_routed_experts divisible by ep_size")
     if config.moe_bias:

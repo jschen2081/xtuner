@@ -89,6 +89,7 @@ def build_ep_execution_runtime(config: Any, ep_mesh: DeviceMesh | None) -> EPExe
             intra_layer_micro_batch=config.intra_layer_micro_batch,
             staging_reference=config.moonep_staging_reference,
             num_sms=config.moonep_num_sms,
+            ip_port=config.moonep_ip_port,
         )
     return NoEPExecutionRuntime()
 

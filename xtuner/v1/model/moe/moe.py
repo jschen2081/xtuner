@@ -172,6 +172,10 @@ class MoEConfig(TransformerConfig):
     # H200 acceptance workload is measurably faster at 64 than its upstream
     # default of 32; keep it model-scoped so other deployments can tune it.
     moonep_num_sms: int = 64
+    # ★ Ascend: SHMEM bootstrap address for cann-shmem symmetric heap init.
+    # Format: "tcp://<master_ip>:<port>". Only used when dispatcher="moonep"
+    # on NPU; GPU path ignores it (NVLink VMM needs no bootstrap).
+    moonep_ip_port: str = "tcp://127.0.0.1:8766"
     # TrainEngine resolves this scalar before model build. MoonEP uses it to
     # size per-invocation resources without depending on TrainerConfig.
     intra_layer_micro_batch: int = 1
@@ -1500,10 +1504,16 @@ class MoE(BaseModel):
 
         self._init_load_spec()
         self._to_empty_meta()
+
+        # ★ DIAG: trace before/after install_after_fsdp
+        import sys as _sys, os as _os
+        _r = _os.environ.get('RANK', '?')
+        print(f"[MOONEP-DIAG rank={_r}] moe.fully_shard: calling install_after_fsdp", flush=True, file=_sys.stderr)
         self._ep_runtime.install_after_fsdp(
             fsdp_root=self,
             execution_order=self.expert_bearing_layers_in_execution_order(),
         )
+        print(f"[MOONEP-DIAG rank={_r}] moe.fully_shard: install_after_fsdp done", flush=True, file=_sys.stderr)
         return self
 
     def expert_bearing_layers_in_execution_order(self) -> list[str]:
