@@ -231,9 +231,20 @@ class MoEBlock(nn.Module):
         weight_layout: ExpertWeightLayout,
     ) -> torch.Tensor:
         trainable = weight_layout.trainable_weights or (None, None)
-        gate_up_out = self.fused_w1w3(x, tokens_per_expert, trainable_weight=trainable[0])
+        # X8 (grad_weight_out): dispatcher-supplied heap gradient slot views.
+        # When present, GroupedLinear → _GMMWithGradWeightOut writes dW directly
+        # into the heap (home add_ + dup copy_), bypassing the autograd dW path;
+        # the bridge still fires via dx to trigger reduce_grad_bf16 + FSDP writeback.
+        gwo = weight_layout.grad_weight_out or (None, None)
+        gate_up_out = self.fused_w1w3(
+            x, tokens_per_expert, trainable_weight=trainable[0],
+            grad_weight_out=gwo[0],
+        )
         out = self.moe_act(gate_up_out, split_dim=-1)
-        res = self.fused_w2(out, tokens_per_expert, trainable_weight=trainable[1])
+        res = self.fused_w2(
+            out, tokens_per_expert, trainable_weight=trainable[1],
+            grad_weight_out=gwo[1],
+        )
         return res
 
 

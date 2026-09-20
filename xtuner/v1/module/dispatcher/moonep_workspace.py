@@ -463,9 +463,10 @@ class _ExpertVMMWorkspace:
         *,
         buffer: Any,
         plan: Any,
-        gradients: tuple[torch.Tensor, torch.Tensor],
+        gradients: tuple[torch.Tensor, torch.Tensor] | None,
         grad_slot: int,
         initialize: bool,
+        x8: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Complete the home-expert gradient boundary in the owning module.
 
@@ -475,10 +476,31 @@ class _ExpertVMMWorkspace:
         (``initialize``, a call-local flag owned by the Dispatcher) and added
         to otherwise; the duplicate suffix is slot-local. ``reduce_grad_bf16``
         then sums the EP partials without dividing.
+
+        X8 path (``x8=True``): ``gradients`` is None — dW was already written
+        into the heap by ``_GMMWithGradWeightOut`` (home ``add_`` + dup
+        ``copy_``) and the home was zeroed in ``prepare_experts``. Skip the
+        zero/add_/copy_ block and only run ``reduce_grad_bf16`` over the slot's
+        heap views, then return the home slices.
         """
         if not 0 <= grad_slot < self._gradient_slots:
             raise ValueError(f"gradient slot out of range: {grad_slot}")
         b = self._experts_per_rank
+        slot_views = self._views["local_grad_outputs"][grad_slot]
+
+        if x8:
+            # dW already in the heap (home add_ + dup copy_ by the GEMM); the
+            # home was zeroed on the first producer in prepare_experts. Only
+            # run the EP exact-sum reduction over the slot's full views.
+            buffer.reduce_grad_bf16(
+                plan=plan,
+                local_grads=slot_views,
+                distributed_duplicate_grads=self._views["distributed_duplicate_grads"][grad_slot],
+                async_finish=False,
+            )
+            return slot_views[0][:b], slot_views[1][:b]
+
+        assert gradients is not None
         # A slot is reused sequentially across physical layers.  A fresh
         # TensorImpl/version counter over the same VMM storage avoids both
         # payload allocation and AOT version clashes.
@@ -489,7 +511,7 @@ class _ExpertVMMWorkspace:
                 target.shape,
                 target.stride(),
             )
-            for target in self._views["local_grad_outputs"][grad_slot]
+            for target in slot_views
         )
         for target, gradient in zip(targets, gradients, strict=True):
             if initialize:

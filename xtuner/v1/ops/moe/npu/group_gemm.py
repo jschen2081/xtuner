@@ -18,9 +18,11 @@ def npu_group_gemm(
         split_sizes: [num_experts] int tensor — tokens per expert group.
         grad_weight_out: optional [num_experts, out_features, in_features]
             bf16 tensor. When provided, the weight gradient from backward
-            is computed via C++ npu_gmm (group_type=2) and copied into this
-            tensor (MoonEP-Ascend XT heap slot). One copy, no hook overhead,
-            dx skipped (MoonEP combine handles activation grad).
+            is computed via C++ npu_gmm (group_type=2) and written into this
+            tensor (home add_ + dup copy_; MoonEP-Ascend XT heap slot). One
+            copy, no hook overhead.  dx is computed via npu_gmm_backward to
+            keep the activation-grad chain live (required to trigger the
+            MoonEP gradient-completion bridge once X8 is wired).
 
     Returns:
         [num_tokens, out_features] bf16 output.
@@ -33,11 +35,13 @@ def npu_group_gemm(
     weights_t = weights.transpose(1, 2)  # [E, I, O] — npu_gmm expects this
 
     if grad_weight_out is not None:
-        # grad_weight_out shape: [E, O, I] — need [E, I, O] to match weights_t
-        gwo_t = grad_weight_out.transpose(1, 2)
+        # ★ P3B (2026-09-20): grad_weight_out = [E,O,I] 堆槽直传 (X8 backward
+        #   grad_t@x → [E,O,I] 直写, 无 transpose)。旧实现 gwo_t=transpose(1,2)
+        #   把 [E,O,I] 堆 view 成 [E,I,O] 喂 backward, 配合旧 x_t@grad 的 [E,I,O]
+        #   输出 + copy_ = o/i 错位 scramble; 现 X8 输出已 [E,O,I], 直传即可。
         return npu_gmm_with_grad_weight_out(
             x, weights_t, group_list=group_list,
-            grad_weight_out=gwo_t, original_weight=None,
+            grad_weight_out=grad_weight_out, original_weight=None,
         )
     else:
         from .gmm import npu_gmm

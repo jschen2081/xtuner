@@ -109,8 +109,13 @@ class _ExpertAscendWorkspace(_ExpertVMMWorkspace):
                 # ★ 同款 C++ 整段视图 [epn+B] (禁 cat/as_strided — storage 边界)
                 grad_full = buffer.xt_grad_full_view(slot, proj)
                 slot_grads.append(grad_full)
+                # ★ 显存炸弹修复 (2026-09-20): 旧实现 .expand(...).contiguous()
+                # 物化 [R,B,O,I] = R× dup (R=2/epn=20/H=HP=6144 → 17GB/rank
+                # 永久占用; R=16 → 138GB 必 OOM)。但 reduce_grad_bf16 对此参数
+                # 仅 assert len(tuple)==2, 数据全不读 (kernel 自取对称堆)。
+                # 改为保留 expand view (零分配, shape [R,B,O,I] 契约不变)。
                 slot_dist.append(
-                    grad_dup.unsqueeze(0).expand(ep_size, *grad_dup.shape).contiguous()
+                    grad_dup.unsqueeze(0).expand(ep_size, *grad_dup.shape)
                 )
             local_grad_outputs.append(slot_grads)
             distributed_duplicate_grads.append(slot_dist)
@@ -231,10 +236,12 @@ class _ExpertAscendWorkspace(_ExpertVMMWorkspace):
                 grad_home = buffer.xt_grad_home_view(slot, proj)           # [B, O_p, I_p]
                 grad_dup = buffer.xt_grad_duplicate_view(slot, proj)       # [B, O_p, I_p]
                 slot_grads.append(torch.cat([grad_home, grad_dup], dim=0))  # [2B, O_p, I_p]
-                # Placeholder [R, B, O_p, I_p] — kernel self-fetches, only
-                # checked non-None by reduce_grad_bf16's contract assertion.
+                # ★ 显存炸弹修复 (2026-09-20): 旧 .expand(...).contiguous() 物化
+                # [R,B,O,I] = R× dup (R=2→17GB/rank; R=16→138GB 必 OOM)。
+                # reduce_grad_bf16 仅 assert len==2, 数据不读 (kernel 自取堆)。
+                # 改为 expand view (零分配, shape 契约 [R,B,O,I] 不变)。
                 slot_dist.append(
-                    grad_dup.unsqueeze(0).expand(ep_size, *grad_dup.shape).contiguous()
+                    grad_dup.unsqueeze(0).expand(ep_size, *grad_dup.shape)
                 )
             local_grad_outputs.append(slot_grads)
             distributed_duplicate_grads.append(slot_dist)
@@ -280,6 +287,25 @@ class _ExpertAscendWorkspace(_ExpertVMMWorkspace):
         dist.barrier(group=self._ep_group)
         self._layout = None
         self._destroyed = True
+
+    # ---------------------------------------------------------------------------
+    # X8 accessors: public hooks for the dispatcher to pull per-slot heap
+    # gradient views so it can inject them as ``grad_weight_out`` into the
+    # expert GroupedLinear forward calls. ``local_grad_outputs[slot][proj]``
+    # is the full [epn+B, O, I] home+dup view (X8 writes home add_ + dup copy_).
+    # ---------------------------------------------------------------------------
+
+    def grad_view(self, slot: int, projection: int) -> torch.Tensor:
+        """Full [epn+B, O, I] heap gradient slot view (home+dup) for X8."""
+        if self._layout is None:
+            raise RuntimeError("Ascend workspace layout not built (buffer deferred?)")
+        return self._views["local_grad_outputs"][slot][projection]
+
+    def home_grad_view(self, slot: int, projection: int) -> torch.Tensor:
+        """Home-only [B, O, I] heap gradient slot view (for the first-mb zero_)."""
+        if self._layout is None:
+            raise RuntimeError("Ascend workspace layout not built (buffer deferred?)")
+        return self._views["local_grad_outputs"][slot][projection][: self._experts_per_rank]
 
     def __del__(self) -> None:
         if getattr(self, "_destroyed", True) or getattr(self, "_layout", None) is None:

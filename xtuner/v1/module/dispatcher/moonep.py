@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, cast
+import os
 
 import torch
 import torch.distributed as dist
@@ -33,7 +34,13 @@ except (ImportError, AttributeError):
     _ON_NPU = False
 
 if _ON_NPU:
-    from xtuner.v1.ops.moe.npu.route_weight import route_weight_rows_backward
+    # ★ P3A: 接线 MoonEP AscendC route_weight 算子 (moonep_ops.route_weight,
+    #   commit cf69813, 单遍 fused AIV, 5.20x 带宽). 签名与 torch 分块实现一致;
+    #   回退到 xtuner 纯 PyTorch 分块实现 (OOM-safe chunked) 当 moonep_ops 未构建.
+    try:
+        from moonep_ascend.ops.route_weight import route_weight_rows_backward
+    except (ImportError, AttributeError):
+        from xtuner.v1.ops.moe.npu.route_weight import route_weight_rows_backward
 else:
     from xtuner.v1.ops.moe.cuda.route_weight import route_weight_rows_backward
 from xtuner.v1.utils import log_rank0
@@ -535,6 +542,14 @@ class _MoonEPLayerCallState:
     # Completed home views and the event covering the pair reduction.
     gradient_completion: tuple[ProjectionPair, Any] | None = None
 
+    # X8 (grad_weight_out direct-to-heap dW) active for this call. When True,
+    # ``prepare_experts`` injects per-slot heap gradient views as
+    # ``grad_weight_out`` into the expert GroupedLinear forward; dW is written
+    # directly into the heap (home add_ + dup copy_) and the bridge receives
+    # ``None`` dW (weights passed as non-leaf). The bridge still fires via the
+    # re-enabled dx to trigger ``reduce_grad_bf16`` + FSDP ``.grad`` writeback.
+    x8_active: bool = False
+
 
 # --- Transaction functions --------------------------------------------------
 #
@@ -572,14 +587,36 @@ def prepare_experts(state: _MoonEPLayerCallState, dispatched: MoonEPDispatchResu
     assert local_weights is not None
     # Join activation and both weight edges so staging precedes upstream
     # activation backward; a weight-only hook cannot establish that dependency.
-    # The bridge already makes the aliases require grad, so grouped GEMM
-    # returns their dW without a leaf ``nn.Parameter`` wrapper.
+    # The bridge makes the aliases require grad (via hidden_states), so grouped
+    # GEMM returns their dW without a leaf ``nn.Parameter`` wrapper.
     hidden_states, w13, w2 = _MoonEPExpertGradBridge.apply(hidden_states, local_weights[0], local_weights[1], state)
+
+    grad_weight_out = None
+    if state.x8_active:
+        # X8: inject per-slot heap gradient views so _GMMWithGradWeightOut writes
+        # dW directly into the heap (home add_ + dup copy_). The bridge still
+        # fires via the re-enabled dx; its backward receives None dW (X8 owns it)
+        # and triggers reduce_grad_bf16 + FSDP .grad writeback.
+        workspace = state.resources.workspace
+        grad_slot = state.grad_slot
+        # The home prefix is a single accumulator shared across every micro-
+        # batch of one FSDP call (same storage for every slot). Zero it once on
+        # the first producer, on the forward stream, ahead of the backward add_.
+        if not state.layer_gradients.initialized:
+            for proj in (0, 1):
+                workspace.home_grad_view(grad_slot, proj).zero_()
+            state.layer_gradients.initialized = True
+        grad_weight_out = (
+            workspace.grad_view(grad_slot, 0),
+            workspace.grad_view(grad_slot, 1),
+        )
+
     return MoonEPPostDispatchResult(
         hidden_states=hidden_states,
         tokens_per_expert=local_counts,
         expert_weight_layout=ExpertWeightLayout(
             trainable_weights=(w13, w2),
+            grad_weight_out=grad_weight_out,
         ),
     )
 
@@ -740,16 +777,37 @@ def combine_backward(state: _MoonEPLayerCallState, grad_output: torch.Tensor) ->
     return grad_weighted, replay_done
 
 
-def start_gradient_completion(state: _MoonEPLayerCallState, gradients: ProjectionPair) -> None:
-    """Hand the allocation-return dW to the workspace for the home return."""
+def start_gradient_completion(state: _MoonEPLayerCallState, gradients: ProjectionPair | None) -> None:
+    """Hand the allocation-return dW to the workspace for the home return.
+
+    ``gradients`` is None on the X8 path (dW already written into the heap by
+    ``_GMMWithGradWeightOut``); the workspace then skips add_/copy_/zero_ and
+    only runs ``reduce_grad_bf16`` + returns the home views.
+    """
     if state.gradient_completion is not None:
         raise RuntimeError("MoonEP gradient completion was started twice")
     resources = state.resources
+    x8 = gradients is None
+
+    # On the X8 path the dW was written to the heap grad views by the grouped
+    # GEMM backward on the compute stream; pass those views as enqueue inputs
+    # so the comm stream (reduce_grad_bf16) waits for the compute-stream writes.
+    if x8:
+        workspace = resources.workspace
+        grad_slot = state.grad_slot
+        inputs: tuple[torch.Tensor, ...] = (
+            workspace.grad_view(grad_slot, 0),
+            workspace.grad_view(grad_slot, 1),
+        )
+    else:
+        inputs = gradients  # type: ignore[assignment]
 
     with torch.profiler.record_function("MoonEP::gradient_handoff"):
         # The workspace owns the ``B`` split, the home-prefix zero-or-add, the
         # duplicate-suffix copy, and the EP exact-sum reduction. ``initialize``
-        # is the call-local flag the Dispatcher owns (ADR-0027).
+        # is the call-local flag the Dispatcher owns (ADR-0027). On X8 the
+        # home was already zeroed in ``prepare_experts`` and dW written by the
+        # GEMM, so return_expert_gradients skips those and only reduces.
         home_grads, done = resources.enqueue(
             lambda: resources.workspace.return_expert_gradients(
                 buffer=resources.buffer,
@@ -757,8 +815,9 @@ def start_gradient_completion(state: _MoonEPLayerCallState, gradients: Projectio
                 gradients=gradients,
                 grad_slot=state.grad_slot,
                 initialize=not state.layer_gradients.initialized,
+                x8=x8,
             ),
-            inputs=gradients,
+            inputs=inputs,
         )
     state.layer_gradients.initialized = True
     state.gradient_completion = (home_grads, done)
@@ -795,13 +854,18 @@ class _MoonEPExpertGradBridge(torch.autograd.Function):
         call_state: _MoonEPLayerCallState,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         ctx.call_state = call_state
+        ctx.x8_active = call_state.x8_active
         return hidden_states, w13, w2
 
     @staticmethod
     def backward(
-        ctx: Any, grad_hidden: torch.Tensor, dw13: torch.Tensor, dw2: torch.Tensor
+        ctx: Any, grad_hidden: torch.Tensor, dw13: torch.Tensor | None, dw2: torch.Tensor | None
     ) -> tuple[torch.Tensor, None, None, None]:
-        start_gradient_completion(cast(_MoonEPLayerCallState, ctx.call_state), (dw13, dw2))
+        # X8: dW was written directly into the heap by _GMMWithGradWeightOut,
+        # so autograd delivers None here. The bridge still fires (via the
+        # re-enabled dx) to trigger reduce_grad_bf16 + FSDP .grad writeback.
+        gradients: ProjectionPair | None = None if ctx.x8_active else (dw13, dw2)
+        start_gradient_completion(cast(_MoonEPLayerCallState, ctx.call_state), gradients)
         # dW is now owned by MoonEP; do not also accumulate it on anchor leaves.
         return grad_hidden, None, None, None
 
@@ -941,12 +1005,20 @@ class MoonEPDispatcher(
         resources = self._runtime.resources
         grad_slot = self._next_gradient_slot
         self._next_gradient_slot = (grad_slot + 1) % resources.gradient_slots
+        # X8 is default-on for the Ascend MoonEP heap path (dW direct-to-heap).
+        # ``XTUNER_MOE_X8=0`` reverts to the autograd-dW bridge path (A/B compare).
+        # Gate on Ascend workspace: the ``grad_view`` accessor is Ascend-only.
+        x8_active = (
+            os.environ.get("XTUNER_MOE_X8", "1") == "1"
+            and isinstance(resources.workspace, _ExpertAscendWorkspace)
+        )
         return _MoonEPLayerCallState(
             resources=resources,
             layer=self._layer,
             generation=resources.home_generation(self._layer),
             grad_slot=grad_slot,
             layer_gradients=layer_gradients,
+            x8_active=x8_active,
         )
 
     @override

@@ -165,15 +165,20 @@ class GroupedLinear(nn.Module):
         tokens_per_expert: torch.Tensor,
         *,
         trainable_weight: torch.Tensor | None = None,
+        grad_weight_out: torch.Tensor | None = None,
     ):
         # A dynamic EP backend may supply a differentiable call-local alias.
-        # The selected one-segment op still returns its dW through autograd.
+        # ★ P3B (2026-09-20): grad_weight_out 非空时走 X8 (_GMMWithGradWeightOut)
+        #   backward 把 dW 直写 [E,O,I] 堆槽 (grad_t@x), 跳过 autograd 中间 dW
+        #   张量 + 拷贝。None (默认) = 原行为 (autograd dw)。由 dispatcher 传入
+        #   MoonEP xt_grad_home_view 堆槽 view; 本层不感知堆语义。
         if trainable_weight is None:
             weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
             weight = weight.view(-1, self.local_out_features, self.local_in_features)
         else:
             weight = trainable_weight
-        out = group_gemm(x, weight, tokens_per_expert)
+        out = group_gemm(x, weight, tokens_per_expert,
+                         grad_weight_out=grad_weight_out)
 
         if self.moe_bias:
             bias = self.bias.to_local() if isinstance(self.bias, DTensor) else self.bias
