@@ -4,8 +4,10 @@ Copy of ``mindspeed/ops/gmm.py`` + a thin wrapper ``_GMMWithGradWeightOut``
 that computes dw via the C++ ``npu_gmm`` forward op (group_type=2, same as
 the C++ backward's internal implementation) and copies into a caller-
 supplied output tensor.  This avoids the hook + extra autograd chain
-overhead of the register_hook approach, and skips computing dx (MoonEP's
-combine handles activation gradients).
+overhead of the register_hook approach.  dx is computed via the official
+``npu_gmm_backward`` so the activation-grad chain stays live — required
+once X8 is wired into the dispatcher (triggers _MoonEPExpertGradBridge →
+reduce_grad_bf16 + FSDP .grad writeback).
 
 The original MindSpeed code (GMMFunction, npu_gmm, npu_gmm_v2) is preserved
 unchanged for backward compatibility.  The new code path is only activated
@@ -135,13 +137,17 @@ class _GMMWithGradWeightOut(torch.autograd.Function):
     """GMM wrapper that writes dw into a caller-supplied tensor.
 
     Forward: calls C++ npu_gmm (same as MindSpeed).
-    Backward: computes dw = npu_gmm(x^T, grad, group_type=2) via C++ forward,
-              copies into grad_weight_out.  Skips dx (MoonEP combine handles it).
+    Backward: dw + dx via C++ npu_gmm_backward (returns (dx, dw, dbias)),
+              dw reshaped to [E,O,I] (= weight.sizes, no layout scramble)
+              and written into grad_weight_out as home add_ + dup copy_
+              (home is a shared cross-micro-batch accumulator).  dx keeps
+              the activation-grad chain live for _MoonEPExpertGradBridge.
 
-    This replicates the C++ npu_gmm_backward's dw computation path:
-        xt = x.transpose()
-        dw = npu_gmm(xt, grad, bias=[], group_list, group_type=2, group_list_type)
-        dw = dw.reshape(weight.sizes())
+    ★ P3B 修正 (2026-09-20): 旧实现走 forward op group_type=2 取 dw
+    (grad^T@x), 但 aclnnGroupedMatmulV4 在 group_type=2 且 x 非分离时强制
+    x 须转置 → 直传被拒 (RuntimeError); 且该路径产 [E,I,O] 经 reshape
+    进堆 = o/i scramble。改用 npu_gmm_backward 一次取 dx+dw (生产路径,
+    内部已 _foreach_transpose, dw 天然 [E,O,I])。
     """
 
     @staticmethod
@@ -169,22 +175,47 @@ class _GMMWithGradWeightOut(torch.autograd.Function):
         if x.shape[0] == 0:
             return None, None, None, None, None
 
-        # dw = npu_gmm(x^T, grad, group_type=2) — same as C++ backward internal
-        x_t = x.transpose(0, 1)
-        grad_output = grad_output.contiguous()
+        # home/dup 拆分: gwo = [epn+B, O, I], epn==B (home 与 dup 均为
+        # experts_per_rank) → b = shape[0]//2 即 home 行数。
+        b = gwo.shape[0] // 2
+
+        # dw + dx 一次取: 官方 npu_gmm_backward 返回 (dx, dw, dbias), dw 形状
+        # == weight.sizes()=[E,O,I] (生产路径, 无布局错位)。★不走 forward op
+        # group_type=2 (aclnnGroupedMatmulV4 在 group_type=2 且 x 非分离时强制
+        # x 须转置 → grad^T@x 直传 x 不转置会被拒; 且该路径产 [E,I,O] 经 reshape
+        # 进堆 = o/i scramble — 旧 P3B 方案证伪)。npu_gmm_backward 内部已含正确
+        # 转置 (_foreach_transpose), dw 天然 [E,O,I], reshape(gwo.shape) no-op。
         if group_list_type == 0:
-            dw_list = GMMFunction.builder.load().npu_gmm(
-                [x_t], [grad_output], [], group_list, 2, group_list_type)
+            dx_list, dw_list, _ = GMMFunction.builder.load().npu_gmm_backward(
+                [grad_output], [x], [weight], group_list, group_list_type)
         else:
-            dw_list = GMMFunction.builder2.load().npu_gmm(
-                [x_t], [grad_output], [], group_list, 2, group_list_type)
-        dw = dw_list[0].reshape(weight.sizes())
+            dx_list, dw_list, _ = GMMFunction.builder2.load().npu_gmm_backward(
+                [grad_output], [x], [weight], group_list, group_list_type)
+        dx = dx_list[0]
+        # npu_gmm 权重约定 [E,I,O] (group_gemm.py: weights.transpose(1,2) 喂入),
+        # 故 npu_gmm_backward 的 dw 形状 = weight.sizes() = [E,I,O]; 堆槽 gwo 为
+        # [E,O,I] (home/dup = out,in) → transpose(1,2) 回堆布局。
+        # ★显存优化 (2026-09-20): 旧 .contiguous().reshape() 物化 [E,O,I] 临时
+        # tensor = 8.6GB/层 瞬时峰值 (proj0 5760+proj1 2880)。去 contiguous,
+        # 直接用 transpose view 喂 add_/copy_ — 后者按 stride 读, bitwise 不变,
+        # 省整个 [E,O,I] 临时物化 (npu_gmm_backward 的 [E,I,O] C++ 输出不可避免,
+        # 但不再额外叠一份 [E,O,I])。注: add_/copy_ 对非连续 source 在 torch_npu
+        # 经 GW-01 + XT-DISPATCH-X8 实测 bitwise 正确 (与 contiguous 路径一致)。
+        dw = dw_list[0].transpose(1, 2)  # [E,O,I] 非连续 view (零物化)
 
-        # Copy into the caller-supplied heap slot
-        gwo.copy_(dw)
+        # 写堆: home 是跨 micro-batch 共享累加器 (见 return_expert_gradients 的
+        # target[:b].add_ 语义), 必须 add_ 累加; dup 是 slot-local, copy_ 覆盖。
+        # 旧 gwo.copy_(dw) 对 home 是覆盖非累加 → 多 micro-batch 丢累加 → 改。
+        gwo[:b].add_(dw[:b])
+        gwo[b:].copy_(dw[b:])
 
-        # dx not needed (MoonEP combine handles activation grad)
-        return None, None, None, None, None
+        # dx 重启用: X8 接线后 _MoonEPExpertGradBridge.backward 由 dx 流回
+        # expert-block 输入触发 → start_gradient_completion → reduce_grad_bf16
+        # (EP dup→home 精确和) + FSDP .grad 回写。若 dx=None 则 bridge 不触发,
+        # 梯度完成链断裂 (reduce_grad 不跑、home 缺远端 dup、.grad 不回写)。
+        # 返回: dx 给 x; weight/group_list/group_list_type/gwo 的 grad=None
+        # (dw 已直写堆槽, 不走 autograd)。
+        return dx, None, None, None, None
 
 
 # ============================================================================
@@ -274,7 +305,10 @@ def npu_gmm_with_grad_weight_out(x, weight, *, group_list, grad_weight_out=None,
 
     When grad_weight_out is None, identical to npu_gmm (backward compatible).
     When provided, backward computes dw via C++ npu_gmm forward (group_type=2)
-    and copies into grad_weight_out — one copy, no hook overhead, no dx computed.
+    and writes into grad_weight_out (home add_ + dup copy_) — one copy, no hook
+    overhead.  dx is computed via npu_gmm_backward to keep the activation-grad
+    chain live (required to trigger _MoonEPExpertGradBridge → reduce_grad_bf16
+    + FSDP .grad writeback when X8 is wired into the dispatcher).
     """
     if grad_weight_out is None:
         return npu_gmm(x, weight, bias=None, group_list=group_list, group_type=0,
