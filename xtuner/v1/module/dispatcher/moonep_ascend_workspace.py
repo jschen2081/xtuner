@@ -210,11 +210,16 @@ class _ExpertAscendWorkspace(_ExpertVMMWorkspace):
                 home_view = buffer.xt_weight_home_view(gen, proj)       # [B, O_p, I_p]
                 dup_view = buffer.xt_weight_duplicate_view(gen, proj)   # [B, O_p, I_p]
                 gen_landings.append(home_view)
-                # ★ 2026-09-23 ZEROCOPY: global/local weights 传 [home, dup]
-                #   两段列表 (不再 torch.cat 物化 [E+B] 副本 -2.4GB@GLM);
-                #   group_gemm 识别列表 → npu_gmm_moep TensorList 配对。
-                gen_globals.append([home_view, dup_view])   # [home B + dup B]
-                gen_locals.append([home_view, dup_view])    # [2B, ...] 同构
+                # ★ 2026-09-23 ZEROCOPY (MOONEP_GMM_ZEROCOPY=1 默认): global/
+                #   local weights 传 [home, dup] 两段列表 (免 torch.cat 物化
+                #   [E+B] 副本 -2.4GB@GLM); group_gemm 识别列表 → npu_gmm_moep
+                #   TensorList 配对。=0 回退 cat 单段 (兼容/对比)。
+                if int(os.environ.get("MOONEP_GMM_ZEROCOPY", "1")) == 1:
+                    gen_globals.append([home_view, dup_view])   # [home B + dup B]
+                    gen_locals.append([home_view, dup_view])    # [2B, ...] 同构
+                else:
+                    gen_globals.append(torch.cat([home_view, dup_view], dim=0))
+                    gen_locals.append(torch.cat([home_view, dup_view], dim=0))
             landings.append(gen_landings)
             global_weights.append(gen_globals)
             local_weights.append(gen_locals)
