@@ -284,8 +284,7 @@ def npu_gmm_with_grad_weight_out(x, weight, *, group_list,
     """
     if grad_weight_out is None:
         return npu_gmm(x, weight, bias=None, group_list=group_list,
-                       group_type=0, gemm_fusion=False,
-                       original_weight=original_weight)
+                       group_type=0, group_list_type=0)
     npu_gmm_param_verification(x, weight, bias=None, group_list=group_list,
                                group_type=0, group_list_type=0)
     return _GMMWithGradWeightOut.apply(x, weight, group_list, 0,

@@ -238,9 +238,12 @@ class _ExpertAscendWorkspace(_ExpertVMMWorkspace):
             slot_grads: list[torch.Tensor] = []
             slot_dist: list[torch.Tensor] = []
             for proj in range(2):
-                grad_home = buffer.xt_grad_home_view(slot, proj)           # [B, O_p, I_p]
-                grad_dup = buffer.xt_grad_duplicate_view(slot, proj)       # [B, O_p, I_p]
-                slot_grads.append(torch.cat([grad_home, grad_dup], dim=0))  # [2B, O_p, I_p]
+                # ★ 2026-09-23 (集成显存评审): 对齐上方第一 build 路径 —
+                #   grad full 视图 (get_xt_grad_view slot=2, 堆内 home+dup
+                #   连续零拷贝); 原 torch.cat([grad_home, grad_dup]) 物化
+                #   [2B,O,I] ≈ 1.6GB@GLM 常驻, 但数据不读 (kernel 自取堆 +
+                #   MR11 确认返回值被 caller 忽略) — 纯浪费。
+                slot_grads.append(buffer.xt_grad_full_view(slot, proj))  # [2B, O_p, I_p]
                 # ★ 显存炸弹修复 (2026-09-20): 旧 .expand(...).contiguous() 物化
                 # [R,B,O,I] = R× dup (R=2→17GB/rank; R=16→138GB 必 OOM)。
                 # reduce_grad_bf16 仅 assert len==2, 数据不读 (kernel 自取堆)。

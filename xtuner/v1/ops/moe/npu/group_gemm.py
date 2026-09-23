@@ -54,4 +54,4 @@ def npu_group_gemm(
     else:
         from .gmm import npu_gmm
         return npu_gmm(x, weights_t, bias=None, group_list=group_list,
-                       group_type=0, gemm_fusion=False, original_weight=None)
+                       group_type=0, group_list_type=0)
