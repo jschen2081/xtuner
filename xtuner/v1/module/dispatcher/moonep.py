@@ -329,6 +329,7 @@ class MoonEPModelRuntime:
         num_sms: int = 64,
         ip_port: str = "tcp://127.0.0.1:8766",
         tokens_per_rank: int | None = None,
+        home_generations: int = 2,
     ) -> None:
         # Config-level capability validation (backend version, EP geometry,
         # dtype, grouped-GEMM backend, ...) lives in ``moonep_capability`` and
@@ -348,6 +349,9 @@ class MoonEPModelRuntime:
         #   install_after_fsdp 用它预建 BufferXtuner → DirectVMM install 早于
         #   FSDP 首次 all_gather (Ascend 路径 landings 来自 buffer home 视图)。
         self._tokens_per_rank = tokens_per_rank
+        # ★ 2026-09-23 (Home 单代): workspace allocate 的 home_generations
+        #   (MOONEP_HOME_GENERATIONS env, 默认 2)。单代省一半 home 显存。
+        self._home_generations = home_generations
         self._landing = build_landing_adapter(staging_reference)
 
         # Physical routed layers in registration (construction) order.
@@ -403,7 +407,7 @@ class MoonEPModelRuntime:
             num_experts=self._num_experts,
             ep_group=self._ep_group,
             gradient_slots=self._gradient_slots,
-            home_generations=2,
+            home_generations=self._home_generations,
             buffer=None,  # ★ Ascend: workspace built lazily in buffer_for
         )
 

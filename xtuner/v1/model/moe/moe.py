@@ -181,6 +181,11 @@ class MoEConfig(TransformerConfig):
     #   install_after_fsdp 用它预建 BufferXtuner (landings 来源), 使
     #   DirectVMM install 早于 FSDP 首次 all_gather。
     moonep_tokens_per_rank: int | None = None
+    # ★ 2026-09-23 (Home 单代优化开关): home 窗口代数。2=双代 double-buffer
+    #   (FSDP implicit prefetch 提前写下一层), 1=单代 (省一半 home 显存,
+    #   EP=16: -1.2GB / EP=8: -2.4GB; 需验证 FSDP prefetch 竞争窗口)。
+    #   env MOONEP_HOME_GENERATIONS 覆盖。
+    moonep_home_generations: int = 2
     # TrainEngine resolves this scalar before model build. MoonEP uses it to
     # size per-invocation resources without depending on TrainerConfig.
     intra_layer_micro_batch: int = 1

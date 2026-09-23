@@ -91,6 +91,7 @@ def build_ep_execution_runtime(config: Any, ep_mesh: DeviceMesh | None) -> EPExe
             num_sms=config.moonep_num_sms,
             ip_port=config.moonep_ip_port,
             tokens_per_rank=config.moonep_tokens_per_rank,
+            home_generations=config.moonep_home_generations,
         )
     return NoEPExecutionRuntime()
 

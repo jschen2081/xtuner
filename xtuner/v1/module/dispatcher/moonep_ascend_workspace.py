@@ -179,8 +179,9 @@ class _ExpertAscendWorkspace(_ExpertVMMWorkspace):
                 experts_per_rank=experts_per_rank,
                 home_generations=home_generations,
             )
-        if home_generations != 2:
-            raise ValueError(f"Ascend workspace requires home_generations=2, got {home_generations}")
+        # ★ 2026-09-23 Home 单代开关: 允许 1 (单代省一半 home) / 2 (双代)
+        if home_generations not in (1, 2):
+            raise ValueError(f"Ascend workspace requires home_generations 1 or 2, got {home_generations}")
         if len(projection_shapes) != 2:
             raise ValueError("MoonEP requires fused w1/w3 and w2 projections (projection_shapes len=2)")
 
