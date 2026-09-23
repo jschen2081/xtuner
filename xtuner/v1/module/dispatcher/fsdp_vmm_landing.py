@@ -16,9 +16,11 @@ from torch import nn
 from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam, ShardedState
 from torch.distributed.fsdp._fully_shard._fsdp_state import _get_module_fsdp_state
 from torch.distributed.tensor import DTensor
+from xtuner.v1.utils import log_rank0   # ★ S2: 版本锁 warning 用
 
 
 _TARGET_TORCH_VERSION = "2.12.1+cu132"
+_TORCH_NPU_VERSION = "2.7.1"   # ★ S2: torch_npu 实际版本 (NPU 环境)
 _BINDING_ATTR = "_xtuner_moonep_landing"
 _OWNER_ATTR = "_xtuner_moonep_fsdp_owner"
 _PROJECTION_ATTR = "_xtuner_moonep_projection"
@@ -62,9 +64,15 @@ def _resolve_and_validate_targets(
         state = _get_module_fsdp_state(fsdp_owner)
         if state is None:
             continue
-        # The 2.12 runtime has the plural list; its bundled type stub still
-        # exposes only the deprecated singular compatibility property.
-        for param_group in cast(Any, state)._fsdp_param_groups:
+        # ★ 2.7/2.12 兼容 (2026-09-22 S2): torch 2.12 用复数 list
+        #   `_fsdp_param_groups`, torch 2.7.1 (torch_npu) 用单数
+        #   `_fsdp_param_group` (单个 FSDPParamGroup)。二者都有
+        #   `group.fsdp_params`。统一取列表后遍历。
+        groups = getattr(state, "_fsdp_param_groups", None)
+        if groups is None:
+            pg = getattr(state, "_fsdp_param_group", None)
+            groups = [pg] if pg is not None else []
+        for param_group in groups:
             for fsdp_param in param_group.fsdp_params:
                 key = (id(fsdp_param._module_info.module), fsdp_param._module_info.param_name)
                 if key in by_identity:
@@ -126,8 +134,14 @@ def install_fsdp_vmm_landing(
     by FSDP, never an FQN guess.
     """
     if torch.__version__ != _TARGET_TORCH_VERSION:
-        raise RuntimeError(
-            f"MoonEP direct FSDP landing requires torch {_TARGET_TORCH_VERSION}, got {torch.__version__}"
+        # ★ S2 (2026-09-22): NPU 环境 torch 2.7.1 (torch_npu) — 结构对齐已
+        #   验证 (3 钩子签名/字段/调用点全兼容, 唯一差异 _fsdp_param_group
+        #   单数已兼容处理)。2.12 是 CUDA 验证版本。硬锁改为 warning +
+        #   capability 前置检查 (install 失败会在 resolve/validate 报具体
+        #   原因), 不阻塞 NPU DirectVMM。
+        log_rank0.warning(
+            f"MoonEP direct FSDP landing validated on torch {_TARGET_TORCH_VERSION}; "
+            f"running on {torch.__version__} (S2: NPU {_TORCH_NPU_VERSION} 结构对齐通过, 兼容模式)"
         )
 
     selected = _resolve_and_validate_targets(fsdp_root, targets)

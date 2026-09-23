@@ -176,6 +176,11 @@ class MoEConfig(TransformerConfig):
     # Format: "tcp://<master_ip>:<port>". Only used when dispatcher="moonep"
     # on NPU; GPU path ignores it (NVLink VMM needs no bootstrap).
     moonep_ip_port: str = "tcp://127.0.0.1:8766"
+    # ★ 2026-09-23 (DirectVMM S 前置): 每 rank 每 micro-batch token 数
+    #   (Fixed-S, 已除 SP)。trainer 在 dataloader 构建后计算并设置 —
+    #   install_after_fsdp 用它预建 BufferXtuner (landings 来源), 使
+    #   DirectVMM install 早于 FSDP 首次 all_gather。
+    moonep_tokens_per_rank: int | None = None
     # TrainEngine resolves this scalar before model build. MoonEP uses it to
     # size per-invocation resources without depending on TrainerConfig.
     intra_layer_micro_batch: int = 1

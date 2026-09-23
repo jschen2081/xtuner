@@ -117,6 +117,9 @@ class _MoonEPResources:
     num_sms: int
     ip_port: str
     _buffer_box: list
+    # ★ 2026-09-23: Ascend DirectVMM 延迟 install 载体 (buffer_for 的 self 是
+    #   resources, frozen dataclass 不能动态赋 → 声明字段, 构造时传入)。
+    _deferred_landing_install: Any = None
 
     def buffer_for(self, tokens_per_rank: int) -> Any:
         """Dispatch entry: build the Fixed-S Buffer once, then check S."""
@@ -150,6 +153,16 @@ class _MoonEPResources:
             # install_after_fsdp via VMM; Ascend defers to here (post-buffer).
             if hasattr(self.workspace, 'build_from_buffer'):
                 self.workspace.build_from_buffer(buffer, self.gradient_slots)
+                # ★ S3 修: DirectVMM 的 install 延迟至此 (layout 刚建好,
+                #   landings 视图可用)。仅一次。
+                if getattr(self, "_deferred_landing_install", None):
+                    fsdp_root, layers = self._deferred_landing_install
+                    # ★ self 是 _MoonEPResources — landing 字段无下划线 (runtime
+                    #   的 _landing 私有属性只存在于 runtime 上, 这里用 self.landing)
+                    self.landing.install(fsdp_root=fsdp_root,
+                                         workspace=self.workspace,
+                                         layers=layers)
+                    self._deferred_landing_install = None
             self._buffer_box.append((buffer, tokens_per_rank))
         buffer, fixed_s = self._buffer_box[0]
         if tokens_per_rank != fixed_s:
@@ -315,6 +328,7 @@ class MoonEPModelRuntime:
         staging_reference: bool,
         num_sms: int = 64,
         ip_port: str = "tcp://127.0.0.1:8766",
+        tokens_per_rank: int | None = None,
     ) -> None:
         # Config-level capability validation (backend version, EP geometry,
         # dtype, grouped-GEMM backend, ...) lives in ``moonep_capability`` and
@@ -330,6 +344,10 @@ class MoonEPModelRuntime:
         self._num_sms = num_sms
         self._gradient_slots = intra_layer_micro_batch
         self._ip_port = ip_port
+        # ★ 2026-09-23 (DirectVMM S 前置): trainer 算好的 Fixed-S (已除 SP)。
+        #   install_after_fsdp 用它预建 BufferXtuner → DirectVMM install 早于
+        #   FSDP 首次 all_gather (Ascend 路径 landings 来自 buffer home 视图)。
+        self._tokens_per_rank = tokens_per_rank
         self._landing = build_landing_adapter(staging_reference)
 
         # Physical routed layers in registration (construction) order.
@@ -395,7 +413,19 @@ class MoonEPModelRuntime:
         comm_stream = torch.cuda.current_stream()
 
         try:
-            self._landing.install(fsdp_root=fsdp_root, workspace=workspace, layers=tuple(self._layers))
+            if hasattr(workspace, "_layout") and workspace._layout is None:
+                # ★ Ascend deferred layout: workspace 的 layout 依赖
+                #   BufferXtuner (landings 来源)。DirectVMM install 必须早于
+                #   FSDP 首次 all_gather → tokens_per_rank 已知时在 resources
+                #   创建后预建 buffer (layout 填充) + 立即 install; 未知时
+                #   (旧路径) 延迟到 buffer_for (首次 dispatch, 有 S 校验兜底)。
+                if self._tokens_per_rank is not None:
+                    self._prebuild_required = True
+                else:
+                    self._deferred_landing_install = (fsdp_root, tuple(self._layers))
+            else:
+                self._landing.install(fsdp_root=fsdp_root, workspace=workspace,
+                                      layers=tuple(self._layers))
         except Exception:
             workspace.destroy()
             raise
@@ -413,7 +443,20 @@ class MoonEPModelRuntime:
             num_sms=self._num_sms,
             ip_port=self._ip_port,
             _buffer_box=[],
+            _deferred_landing_install=getattr(self, "_deferred_landing_install", None),
         )
+        self._deferred_landing_install = None
+        # ★ 2026-09-23 (DirectVMM S 前置): tokens_per_rank 已知 → 立即预建
+        #   buffer (build_from_buffer 填 workspace layout) + DirectVMM install。
+        #   此处早于任何 FSDP all_gather (模型刚 fully_shard, 训练未开始)。
+        if getattr(self, "_prebuild_required", False):
+            self._prebuild_required = False
+            self._resources.buffer_for(self._tokens_per_rank)
+            self._resources.landing.install(
+                fsdp_root=fsdp_root, workspace=workspace,
+                layers=tuple(self._layers))
+            log_rank0.info(
+                f"[MoonEP] DirectVMM installed early (tokens_per_rank={self._tokens_per_rank})")
 
     @property
     def resources(self) -> _MoonEPResources:

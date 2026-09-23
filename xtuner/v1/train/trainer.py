@@ -719,6 +719,40 @@ class Trainer:
                 assert_info += f", HF path load error Info: {error_info}"
             assert hf_interval is None and hf_max_keep is None and async_hf_export is False, assert_info
 
+        # ★ 2026-09-23 (DirectVMM S 前置): dataloader 已建, 实测每 rank 每
+        #   micro-batch token 数 (Fixed-S): peek 第一个 batch 的 seq_ctx 总
+        #   token, 除以 SP (序列并行切分后每 rank 序列减半)。实测优先 —
+        #   公式 (micro_batch×pack_max) 与 soft pack 实际每样本长度偏差
+        #   (实测 8192 vs 公式 16384, 差 2×), 以 peek 为准。
+        #   注: peek 消耗第一个 batch (Fixed-S 每 batch 相同, 验证期可接受)。
+        if getattr(model_cfg, "dispatcher", None) == "moonep":
+            s_total = None
+            try:
+                peek_batch = next(iter(self._dataloader))
+                if peek_batch:
+                    sq = peek_batch[0].get("seq_ctx")
+                    if sq is not None and getattr(sq, "cu_seq_lens", None) is not None:
+                        cl = sq.cu_seq_lens
+                        s_total = int(cl[-1].item() if hasattr(cl[-1], "item") else cl[-1])
+            except Exception as _peek_err:
+                log_rank0.warning(f"[MoonEP] S peek failed: {_peek_err}")
+            if s_total is None:
+                pack_max = getattr(dataloader_cfg, "pack_max_length", None)
+                if pack_max is None and dataloader_cfg.dataset_config_list:
+                    pack_max = getattr(dataloader_cfg.dataset_config_list[0],
+                                       "pack_max_length", None)
+                s_total = (self.micro_batch_size * int(pack_max)) if pack_max else None
+            if s_total is not None and sp_size > 0:
+                # S = 单 micro-batch token ÷ SP: peek 的 batch_total 是整个
+                # batch (micro_batch 个 micro-batch 拼成), 先除 micro_batch,
+                # 再除 SP (序列并行切分)。实测 32768/(2×2)=8192 ✓。
+                s_per_rank = s_total // (self.micro_batch_size * sp_size)
+                model_cfg.moonep_tokens_per_rank = s_per_rank
+                log_rank0.info(
+                    f"[MoonEP] tokens_per_rank (S) = {s_per_rank} "
+                    f"(batch_total={s_total} ÷ micro_batch={self.micro_batch_size} "
+                    f"÷ SP={sp_size})")
+
         self._engine = self.build_engine(
             model_path=load_from,
             model_config=model_cfg,
