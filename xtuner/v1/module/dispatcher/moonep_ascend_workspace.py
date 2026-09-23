@@ -210,13 +210,15 @@ class _ExpertAscendWorkspace(_ExpertVMMWorkspace):
                 home_view = buffer.xt_weight_home_view(gen, proj)       # [B, O_p, I_p]
                 dup_view = buffer.xt_weight_duplicate_view(gen, proj)   # [B, O_p, I_p]
                 gen_landings.append(home_view)
-                # ★ 2026-09-23 ZEROCOPY (MOONEP_GMM_ZEROCOPY=1 默认): global/
-                #   local weights 传 [home, dup] 两段列表 (免 torch.cat 物化
-                #   [E+B] 副本 -2.4GB@GLM); group_gemm 识别列表 → npu_gmm_moep
-                #   TensorList 配对。=0 回退 cat 单段 (兼容/对比)。
+                # ★ 2026-09-23 ZEROCOPY (MOONEP_GMM_ZEROCOPY=1 默认):
+                #   home+dup 窗口内物理连续 → global/local weights = full_view
+                #   单段 [epn+B] 窗口 view (零物化); group_gemm 单段路径 →
+                #   npu_gmm + npu_gmm_backward view (免 stack 1.6GB 瞬时)。
+                #   列表路径 (moep) 保留作兼容 (backward 有 stack 物化)。
                 if int(os.environ.get("MOONEP_GMM_ZEROCOPY", "1")) == 1:
-                    gen_globals.append([home_view, dup_view])   # [home B + dup B]
-                    gen_locals.append([home_view, dup_view])    # [2B, ...] 同构
+                    full_view = buffer.xt_weight_full_view(gen, proj)   # [epn+B, ...] 窗口连续
+                    gen_globals.append(full_view)
+                    gen_locals.append(full_view)
                 else:
                     gen_globals.append(torch.cat([home_view, dup_view], dim=0))
                     gen_locals.append(torch.cat([home_view, dup_view], dim=0))
