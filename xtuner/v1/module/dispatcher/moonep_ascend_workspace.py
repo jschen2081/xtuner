@@ -210,14 +210,11 @@ class _ExpertAscendWorkspace(_ExpertVMMWorkspace):
                 home_view = buffer.xt_weight_home_view(gen, proj)       # [B, O_p, I_p]
                 dup_view = buffer.xt_weight_duplicate_view(gen, proj)   # [B, O_p, I_p]
                 gen_landings.append(home_view)
-                # global_weights = cat(all_home + local_dup) → [E+B, O_p, I_p]
-                # On Ascend the kernel fetches remote home rows via symmetric
-                # heap ROCE; the [E+B] cat here gives the grouped-GEMM-read
-                # contiguous [home epn + dup B] local alias.
-                # Note: epn (E/R) home rows + B dup rows = E+B in the local
-                # heap context (epn == B when B=E/R, which is the training default).
-                gen_globals.append(torch.cat([home_view, dup_view], dim=0))  # [E+B, ...]
-                gen_locals.append(torch.cat([home_view, dup_view], dim=0))   # [2B, ...]
+                # ★ 2026-09-23 ZEROCOPY: global/local weights 传 [home, dup]
+                #   两段列表 (不再 torch.cat 物化 [E+B] 副本 -2.4GB@GLM);
+                #   group_gemm 识别列表 → npu_gmm_moep TensorList 配对。
+                gen_globals.append([home_view, dup_view])   # [home B + dup B]
+                gen_locals.append([home_view, dup_view])    # [2B, ...] 同构
             landings.append(gen_landings)
             global_weights.append(gen_globals)
             local_weights.append(gen_locals)
