@@ -1,6 +1,6 @@
 """Forked MindSpeed GMM with grad_weight_out support — ★ MoonEP-Ascend 自研版.
 
-2026-09-23: 彻底移除 mindspeed 依赖 — npu_gmm / npu_gmm_moep /
+2026-09-23: 彻底移除 mindspeed 依赖 — npu_gmm /
 npu_gmm_backward 全部由 MoonEP-Ascend ops/gmm 实现 (moonep_ops._gmm,
 底层直调 CANN aclnnGroupedMatmulV4)。接口语义与原版兼容。
 
@@ -20,7 +20,7 @@ except ImportError:
     )
 
 __all__ = ["npu_gmm", "npu_gmm_v2", "npu_gmm_with_grad_weight_out",
-           "npu_gmm_moep"]
+]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -79,6 +79,11 @@ class _GMMWithGradWeightOut(torch.autograd.Function):
     def forward(ctx, x, weight, group_list, group_list_type, grad_weight_out):
         outputs = moonep_ops.npu_gmm(x, weight, None, group_list, 0,
                                      group_list_type)
+        if int(os.environ.get("MOONEP_DBG_DWSHAPE", "0")):
+            print(f"[GMM-fwd] rank={torch.distributed.get_rank()} "
+                  f"out.norm={outputs.float().norm().item():.4f} "
+                  f"x.norm={x.float().norm().item():.4f} "
+                  f"x.shape={tuple(x.shape)}", flush=True)
         ctx.save_for_backward(x, weight)
         ctx.group_list = group_list
         ctx.group_list_type = group_list_type
@@ -166,113 +171,6 @@ def npu_gmm_v2(x, weight, *, bias=None, group_list=None, group_type=0,
     group_args = (group_list, group_type, False, 1,
                   1 if isinstance(group_list, (torch.Tensor, type(None))) else 0)
     return GMMFunction.apply(original_weight, x, weight, bias, group_args)
-
-
-def npu_gmm_moep(x, weights, *, group_list=None, out=None, bias=None,
-                 group_type=0, gemm_fusion=False, grad_weight_out=None):
-    """MoonEP ZEROCOPY grouped GEMM (TensorList weight + out 直写堆).
-
-    Args:
-        x: TensorList, 每专家一组输入 [M_i, K] bf16 (aclnn TensorList 配对,
-           与 weights 等长; dispatch 输出已按专家行排序, 调用方按组切)。
-        weights: TensorList, 每专家独立权重 [K, N] bf16 — [home_view,
-           dup_view] 或逐专家, 免 torch.cat 物化。
-        out: 可选预分配 MoonEP 堆输出视图 [ΣM, N] — ACLNN 直写 (ZEROCOPY)。
-        grad_weight_out: 可选 [E,O,I] 堆槽 — backward 的 dw 直写 (X8)。
-    """
-    if not isinstance(x, (list, tuple)):
-        x = [x]
-    if not isinstance(weights, (list, tuple)):
-        raise TypeError("npu_gmm_moep weights must be a list/tuple of tensors")
-    if len(x) != len(weights):
-        raise ValueError(f"npu_gmm_moep x({len(x)}) and weights({len(weights)}) "
-                         f"must be paired")
-    if bias is not None:
-        raise ValueError("npu_gmm_moep bias not supported (MoonEP 无 bias)")
-    if grad_weight_out is not None:
-        return _GMMMoepGradOut.apply(*x, *weights, group_list, out,
-                                     grad_weight_out, len(x))
-    return _GMMMoepFunction.apply(*x, *weights, group_list, out,
-                                  len(x))
-
-
-class _GMMMoepFunction(torch.autograd.Function):
-    """npu_gmm_moep autograd (无 gwo): forward 直写 + backward dx。
-
-    ★ apply 参数须为 Tensor (list 参数不被 autograd 追踪 → 展平传入)。
-    """
-
-    @staticmethod
-    def forward(ctx, *args):
-        x_len = int(args[-1])
-        out = args[-2]
-        group_list = args[-3]
-        x_list = list(args[:x_len])
-        weights = list(args[x_len:-3])
-        outputs = moonep_ops.npu_gmm_moep(x_list, weights, None, group_list, 0, 0,
-                                          out if out is not None else None)
-        ctx.has_gl = group_list is not None
-        if group_list is not None:
-            ctx.save_for_backward(*x_list, *weights, group_list)
-        else:
-            ctx.save_for_backward(*x_list, *weights)
-        ctx.x_len = x_len
-        ctx.weights_len = len(weights)
-        return outputs
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        saved = ctx.saved_tensors
-        x_list = saved[:ctx.x_len]
-        weights = saved[ctx.x_len:ctx.x_len + ctx.weights_len]
-        group_list = saved[-1] if ctx.has_gl else None
-        x = torch.cat(x_list, 0)
-        w = torch.stack(weights, 0)      # [E,K,N]
-        dx, _ = moonep_ops.npu_gmm_backward(grad_output, x, w, group_list, 0)
-        dx_segs = dx.split([xi.size(0) for xi in x_list], 0)   # 按段切回
-        return (*dx_segs, *[None] * (ctx.weights_len + 3))     # x 段 + w 段 + gl + out + len
-
-
-class _GMMMoepGradOut(torch.autograd.Function):
-    """npu_gmm_moep + X8: backward dw 直写 grad_weight_out (home add_ + dup copy_)."""
-
-    @staticmethod
-    def forward(ctx, *args):
-        x_len = int(args[-1])
-        grad_weight_out = args[-2]
-        out = args[-3]
-        group_list = args[-4]
-        x_list = list(args[:x_len])
-        weights = list(args[x_len:-4])
-        outputs = moonep_ops.npu_gmm_moep(x_list, weights, None, group_list, 0, 0,
-                                          out if out is not None else None)
-        ctx.has_gl = group_list is not None
-        if group_list is not None:
-            ctx.save_for_backward(*x_list, *weights, group_list)
-        else:
-            ctx.save_for_backward(*x_list, *weights)
-        ctx.x_len = x_len
-        ctx.weights_len = len(weights)
-        ctx.grad_weight_out = grad_weight_out
-        return outputs
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        saved = ctx.saved_tensors
-        x_list = saved[:ctx.x_len]
-        weights = saved[ctx.x_len:ctx.x_len + ctx.weights_len]
-        group_list = saved[-1] if ctx.has_gl else None
-        gwo = ctx.grad_weight_out
-
-        x = torch.cat(x_list, 0)
-        w = torch.stack(weights, 0)      # [E,K,N]
-        dx, dw = moonep_ops.npu_gmm_backward(grad_output, x, w, group_list, 0)
-        dw = dw.transpose(1, 2)          # [E,O,I]
-        b = gwo.shape[0] // 2
-        gwo[:b].add_(dw[:b])
-        gwo[b:].copy_(dw[b:])
-        dx_segs = dx.split([xi.size(0) for xi in x_list], 0)   # 按段切回
-        return (*dx_segs, *[None] * (ctx.weights_len + 4))     # x 段 + w 段 + gl + out + gwo + len
 
 
 def npu_gmm_with_grad_weight_out(x, weight, *, group_list,
