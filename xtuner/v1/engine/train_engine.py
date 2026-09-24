@@ -285,6 +285,21 @@ class TrainEngine:
         all_grads = [p.grad for p in trainable_params if p.grad is not None]
         total_grad_norm, grouped_all_grads = self.model.cal_grad_norm(all_grads, dtype=dtype)
 
+        if os.environ.get("MOONEP_DBG_DWSHAPE", "0") == "1" and \
+                torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            # ★ 梯度 dump (2026-09-24): 保存 2 个参数梯度 (layernorm + expert) 到文件,
+            #   两次运行逐元素对比 → 判别竞态 (少数元素差) vs 浮点累加序 (全部微差)。
+            import torch as _t
+            _names = [n for n, _ in self.model.trainable_parameters()]
+            _dump = {}
+            for _gi, (_g, _nm) in enumerate(zip(all_grads, _names)):
+                if _gi in (0, 1) and len(_dump) < 2:
+                    _gg = _g.to_local().detach().float().cpu() if hasattr(_g, "to_local") else _g.detach().float().cpu()
+                    _dump[f"p{_gi}_{_nm.rsplit('.',1)[-1]}"] = _gg
+            _dump_path = os.environ.get("MOONEP_GRAD_DUMP", "/tmp/moonep_grad_dump.pt")
+            _t.save(_dump, _dump_path)
+            print(f"[GRAD-DUMP] rank0 saved {list(_dump.keys())} → {_dump_path}", flush=True)
+
         if do_clip:
             clip_param_ids = {
                 id(p) for group in self.optimizer.param_groups if group.get("clip_grad", True) for p in group["params"]
