@@ -28,6 +28,7 @@ class FSDPConfig(BaseModel):
     # Keep this disabled unless the target model/config has explicitly validated
     # the full-offload path on the target PyTorch version.
     cpu_offload: Annotated[bool, Parameter(help="Enable CPU offloading for memory optimization")] = False
+    mtp_checkpoint_use_reentrant: Annotated[bool, Parameter(help="Use reentrant checkpoint for MTP physical layers with MoonEP")] = False
     # TODO: (caoweihan) Convert `torch.dtype` to `Annotated` for compatibility with cyclopts
     param_dtype: Annotated[torch.dtype, Parameter(help="Data type for model parameters")] = torch.bfloat16
     reduce_dtype: Annotated[torch.dtype, Parameter(help="Data type for reduction operations")] = torch.bfloat16

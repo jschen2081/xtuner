@@ -69,7 +69,7 @@ def check_fsdp_policy(config: Any, fsdp_config: Any) -> None:
 
     # A blocking rule from the domain model that had no code before: a
     # checkpoint-wrapped MTP physical layer must use reentrant checkpointing.
-    if _any_mtp_layer_checkpoint_wrapped(config, fsdp_config) and not fsdp_config.mtp_checkpoint_use_reentrant:
+    if _any_mtp_layer_checkpoint_wrapped(config, fsdp_config) and not getattr(fsdp_config, "mtp_checkpoint_use_reentrant", False):
         raise ValueError(
             "a checkpoint-wrapped MTP physical layer requires FSDPConfig.mtp_checkpoint_use_reentrant=True with MoonEP"
         )

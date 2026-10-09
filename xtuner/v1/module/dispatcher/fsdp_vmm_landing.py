@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import types
 from collections.abc import Sequence
-from typing import Any, cast
 
 import torch
 from torch import nn
@@ -102,9 +101,23 @@ def _resolve_and_validate_targets(
                 )
             if landing.numel() != unpadded_numel or landing.dtype is not expected_dtype:
                 raise RuntimeError(f"MoonEP VMM landing metadata mismatch for {layer_fqn}.{projection_name}")
-            if landing.device != fsdp_param.device or shard_world_size <= 1:
+            if landing.device != fsdp_param.device:
                 raise RuntimeError(
-                    f"MoonEP direct landing requires multi-rank CUDA FSDP for {layer_fqn}.{projection_name}"
+                    f"MoonEP VMM landing device {landing.device} != FSDP device "
+                    f"{fsdp_param.device} for {layer_fqn}.{projection_name}"
+                )
+            if shard_world_size <= 1:
+                # ★ 2026-10-09 (单机全 EP): shard=1 时专家权重已完整在本地
+                #   (build_grouped_linear 按 EP 切), FSDP shard 维度 trivial。
+                #   DirectVMM hook 机制不变: landing 仍由
+                #   foreach_all_gather_copy_out 的 split_with_sizes_copy 写入,
+                #   1-rank 子组 allgather/RS 退化为本地拷贝, 首次 AllGather
+                #   填充 home rows; grad 侧 foreach_reduce 对 ws=1 通用。
+                #   语义与多 rank 一致, 仅无跨 shard 平均 (home 专家本就
+                #   只有本 rank 计算)。
+                log_rank0.info(
+                    f"MoonEP direct landing single-shard mode (shard_world_size=1): "
+                    f"{layer_fqn}.{projection_name}"
                 )
             if hasattr(fsdp_param._sharded_local_tensor, "fsdp_post_all_gather"):
                 raise RuntimeError(f"MoonEP direct landing does not support post-AllGather extensions: {layer_fqn}")

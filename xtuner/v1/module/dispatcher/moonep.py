@@ -1006,10 +1006,27 @@ class _CombineAutograd(torch.autograd.Function):
     def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None, None]:
         grad_weighted, replay_done = combine_backward(cast(_MoonEPLayerCallState, ctx.call_state), grad_output)
         expert_output, route_weights = ctx.saved_tensors
+        # ★ 2026-10-02 修复: rw 重排到槽序 — route_weights 是 token-major
+        #   ([S,K] 展平, 行=t*K+k), 而 grad_weighted/expert_output 是槽序
+        #   (expert-major, 按 plan.dst 打包)。逐行乘 = ×错权重 (槽 i 的源
+        #   token ≠ i/K) → ge 方向错 (实测 cos≈0 + 17x 放大)。按 plan.dst
+        #   把权重重排到槽序 (loff 索引, 多 token 同槽后写覆盖与槽内容一致)。
+        _cs = cast(_MoonEPLayerCallState, ctx.call_state)
+        _rw_flat = route_weights
+        if _cs.plan is not None and _cs.plan.dst is not None:
+            _dst = _cs.plan.dst.reshape(-1)
+            _d_abs = torch.where(_dst < 0, -_dst - 1, _dst)
+            _nvs = int(_cs.plan.NvS)
+            _loff = _d_abs % _nvs
+            _rw_slot = torch.zeros(_nvs, dtype=torch.float32, device=_rw_flat.device)
+            _rw_slot.index_copy_(0, _loff.to(torch.int64), _rw_flat)
+            _rw = _rw_slot
+        else:
+            _rw = _rw_flat
         grad_expert, grad_route_weights = route_weight_rows_backward(
             grad_weighted,
             expert_output,
-            route_weights,
+            _rw,
         )
         # The next autograd node immediately reads duplicated weights.
         replay_done.wait()

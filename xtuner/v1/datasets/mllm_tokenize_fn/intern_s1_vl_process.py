@@ -1,9 +1,15 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import io
 
-import torchvision.transforms as T
+try:
+    import torchvision.transforms as T
+    from torchvision.transforms.functional import InterpolationMode
+except ImportError:
+    # ★ 2026-09-24 (torch 2.12.0): 无匹配 torchvision 时降级 — 本文件仅
+    #   InternS1VL (vision) 数据管线使用, GLM 文本训练不触发 (调用时再报错)。
+    T = None
+    InterpolationMode = None
 from PIL import Image
-from torchvision.transforms.functional import InterpolationMode
 
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)

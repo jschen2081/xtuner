@@ -168,6 +168,8 @@ class MoEConfig(TransformerConfig):
     # experts into MoonEP VMM after AllGather. It is an explicit bring-up path;
     # production direct landing is installed by the later FSDP adapter.
     moonep_staging_reference: bool = False
+    # ★ 2026-09-24: MOONEP_STAGING_REFERENCE env 覆盖 (脚本 export 需生效,
+    #   与 HOME_GENERATIONS 一致)。
     # MoonEP reserves this many SMs for its communication kernels.  The
     # H200 acceptance workload is measurably faster at 64 than its upstream
     # default of 32; keep it model-scoped so other deployments can tune it.

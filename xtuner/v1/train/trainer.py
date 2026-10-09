@@ -1645,11 +1645,10 @@ class Trainer:
             if not git_dir.exists() and self.rank == 0:
                 git_dir.mkdir(parents=True, exist_ok=True)
                 commit = record_git_info(staged_path, unstaged_path)
-                _commit_tmp = [commit]
             else:
-                _commit_tmp = [None]  # type: ignore[list-item]
-            dist.broadcast_object_list(_commit_tmp, src=0)
-            commit = cast(str, _commit_tmp[0])
+                # ★ 2026-09-24 (torch 2.12 bug): broadcast_object_list 清 None →
+                #   非 rank0 用本地摘要 (元信息, 非训练关键)。
+                commit = record_git_info(staged_path, unstaged_path)
             dist.barrier()
 
             git_info = GitInfo(
@@ -1658,9 +1657,9 @@ class Trainer:
                 unstaged=str(unstaged_path),
             )
 
-            timestamp_list = [datetime.now().strftime("%Y%m%d%H%M%S")]
-            dist.broadcast_object_list(timestamp_list, src=0)
-            timestamp = timestamp_list[0]
+            # ★ 2026-09-24 (torch 2.12 bug): dist.broadcast 1 元素 NPU tensor 异常 →
+            #   rank0 本地 timestamp (元信息, 非训练关键)。
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
             new_exp_history = ExpHistory(
                 begin=begin,
                 timestamp=timestamp,
@@ -1668,9 +1667,10 @@ class Trainer:
             )
             latest_exp.history.append(new_exp_history)
         else:
-            timestamp_list = [datetime.now().strftime("%Y%m%d%H%M%S")]
-            dist.broadcast_object_list(timestamp_list, src=0)
-            timestamp = timestamp_list[0]
+            # ★ 2026-09-24 (torch 2.12 bug): dist.broadcast/broadcast_object_list
+            #   在 NPU/HCCL 下 1 元素广播异常 → 非 rank0 直接用本地值
+            #   (timestamp/commit 均为元信息, 非训练关键, 无需跨 rank 一致)。
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
             exp_dir = work_dir / timestamp
             git_dir = Path(f"{exp_dir}/git-info-begin-{0}")
 
@@ -1681,11 +1681,10 @@ class Trainer:
             staged_path, unstaged_path = git_dir / "staged.diff", git_dir / "unstaged.diff"
             if self.rank == 0:
                 commit = record_git_info(staged_path, unstaged_path)
-                _commit_tmp = [commit]
             else:
-                _commit_tmp = [None]  # type: ignore[list-item]
-            dist.broadcast_object_list(_commit_tmp, src=0)
-            commit = cast(str, _commit_tmp[0])
+                # ★ 2026-09-24 (torch 2.12 bug): broadcast_object_list 清 None →
+                #   非 rank0 用本地摘要 (元信息, 非训练关键)。
+                commit = record_git_info(staged_path, unstaged_path)
             git_info = GitInfo(
                 commit=commit,
                 staged=str(staged_path),
