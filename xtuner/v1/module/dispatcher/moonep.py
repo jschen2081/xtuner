@@ -987,6 +987,79 @@ class _DispatchAutograd(torch.autograd.Function):
         return grad_hidden, None, None, grad_route_weights, None, None
 
 
+def _route_weights_full_slots(
+    route_weights: torch.Tensor,
+    dst: torch.Tensor,
+    nvs: int,
+    group: Any,
+) -> torch.Tensor:
+    """Assemble the complete slot-major route weights for this rank's segment.
+
+    ``route_weights`` is token-major (``[S*K]`` flattened, row ``t*K+k``), and each entry's
+    slot lives at ``decode(dst[t*K+k])`` in the **global** packed space
+    ``[0, world * nvs)`` -- a bijection per the plan. ``grad_weighted`` / ``expert_output``
+    have one row per slot of this rank's segment, and those slots mostly hold *other* ranks'
+    tokens (measured ~7% of a rank's own ``dst`` entries land in its own segment at EP=16).
+    The missing weights live on the tokens' home ranks, so every rank scatters its own
+    token-major weights into global packed positions and the expert-parallel group sums
+    them; each global slot is written by exactly one rank, so the sum is exact.
+
+    Args:
+        route_weights (torch.Tensor): ``[S*K]`` token-major weights of this rank's tokens.
+        dst (torch.Tensor): ``[S*K]`` global packed destinations (``dest * nvs + offset``).
+        nvs (int): slots per rank, including per-segment padding.
+        group (Any): the expert-parallel process group.
+
+    Returns:
+        torch.Tensor: ``[nvs]`` float32 weights indexed by this rank's local slot.
+    """
+    flat_dst = dst.reshape(-1)
+    d_abs = torch.where(flat_dst < 0, -flat_dst - 1, flat_dst).to(torch.int64)
+    flat_w = route_weights.reshape(-1).to(torch.float32)
+    world = dist.get_world_size(group)
+    full = torch.zeros(world * nvs, dtype=torch.float32, device=flat_w.device)
+    full.index_copy_(0, d_abs, flat_w)
+    dist.all_reduce(full, op=dist.ReduceOp.SUM, group=group)
+    rank = dist.get_rank(group)
+    return full[rank * nvs : (rank + 1) * nvs]
+
+
+def _grad_route_slots_to_tokens(
+    grad_route_slot: torch.Tensor,
+    dst: torch.Tensor,
+    nvs: int,
+    group: Any,
+) -> torch.Tensor:
+    """Gather a slot-indexed route-weight gradient back to token-major order.
+
+    ``grad_route_slot`` is ``[nvs]`` and holds, on each rank, the values of **that rank's
+    own segment** of the global packed space. Each token-major entry ``i = t*K+k`` of this
+    rank's tokens points at a global slot ``decode(dst[i])`` that generally lives on another
+    rank, so the value is pulled from the owner: the per-rank segments are gathered into the
+    global array and indexed by ``dst``.
+
+    A plain ``all_reduce`` over per-rank partial arrays is **not** equivalent: every rank's
+    ``[S*K]`` array is indexed by its *own* tokens, and the ranks hold different tokens, so
+    the index spaces do not align.
+
+    Args:
+        grad_route_slot (torch.Tensor): ``[nvs]`` gradient indexed by this rank's local slot.
+        dst (torch.Tensor): ``[S*K]`` global packed destinations from the saved plan.
+        nvs (int): slots per rank, including per-segment padding.
+        group (Any): the expert-parallel process group.
+
+    Returns:
+        torch.Tensor: ``[S*K]`` float32 gradient in token-major order.
+    """
+    seg = grad_route_slot.reshape(-1).to(torch.float32).contiguous()
+    world = dist.get_world_size(group)
+    gathered = torch.empty(world * nvs, dtype=torch.float32, device=seg.device)
+    dist.all_gather_into_tensor(gathered, seg, group=group)
+    flat_dst = dst.reshape(-1)
+    d_abs = torch.where(flat_dst < 0, -flat_dst - 1, flat_dst).to(torch.int64)
+    return gathered[d_abs]
+
+
 class _CombineAutograd(torch.autograd.Function):
     """Bridge fused combine and saved-plan dispatch into autograd."""
 
@@ -1006,28 +1079,39 @@ class _CombineAutograd(torch.autograd.Function):
     def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None, None]:
         grad_weighted, replay_done = combine_backward(cast(_MoonEPLayerCallState, ctx.call_state), grad_output)
         expert_output, route_weights = ctx.saved_tensors
-        # ★ 2026-10-02 修复: rw 重排到槽序 — route_weights 是 token-major
-        #   ([S,K] 展平, 行=t*K+k), 而 grad_weighted/expert_output 是槽序
-        #   (expert-major, 按 plan.dst 打包)。逐行乘 = ×错权重 (槽 i 的源
-        #   token ≠ i/K) → ge 方向错 (实测 cos≈0 + 17x 放大)。按 plan.dst
-        #   把权重重排到槽序 (loff 索引, 多 token 同槽后写覆盖与槽内容一致)。
         _cs = cast(_MoonEPLayerCallState, ctx.call_state)
-        _rw_flat = route_weights
-        if _cs.plan is not None and _cs.plan.dst is not None:
-            _dst = _cs.plan.dst.reshape(-1)
-            _d_abs = torch.where(_dst < 0, -_dst - 1, _dst)
-            _nvs = int(_cs.plan.NvS)
-            _loff = _d_abs % _nvs
-            _rw_slot = torch.zeros(_nvs, dtype=torch.float32, device=_rw_flat.device)
-            _rw_slot.index_copy_(0, _loff.to(torch.int64), _rw_flat)
-            _rw = _rw_slot
+        # ★ 2026-10-12 修复 (MoE 块反向梯度系统性偏低根因, 两条独立路径):
+        #   route_weights 是 token-major ([S,K] 展平, 行=t*K+k), 而
+        #   grad_weighted/expert_output 的行是本 rank 段的**槽序** (全局打包空间
+        #   [0, world*NvS) 中本 rank 的 [rank*NvS, (rank+1)*NvS) 段)。
+        #   plan.dst 是 (token, expert) → 全局槽的双射 (实测 hit=nslot, coll=0),
+        #   且本 rank 段里大多是**别的 rank** 的 token (EP=16 实测只有 ~7% 的
+        #   dst 条目落在本 rank 段内)。所以:
+        #   1) grad_expert 的逐行权重必须跨 rank 组装完整槽序数组 (本 rank 只
+        #      掌握自己 token 的权重); 旧的按 loff 直接 index_copy 会把别的
+        #      rank 段的槽也写成本 rank token 的权重。
+        #   2) grad_route_weights 按槽序产出, 却要作为 token-major route_weights
+        #      的梯度返回 —— 必须按 dst 从槽拥有者处 gather 回 token 序。
+        _plan = _cs.plan
+        _dst = _plan.dst if _plan is not None else None
+        if _dst is not None:
+            _grp = _cs.resources.ep_group
+            _nvs = int(_plan.NvS)
+            _rw = _route_weights_full_slots(route_weights, _dst, _nvs, _grp)
         else:
-            _rw = _rw_flat
+            _rw = route_weights
         grad_expert, grad_route_weights = route_weight_rows_backward(
             grad_weighted,
             expert_output,
             _rw,
         )
+        if _dst is not None:
+            grad_route_weights = _grad_route_slots_to_tokens(
+                grad_route_weights,
+                _dst,
+                _nvs,
+                _grp,
+            )
         # The next autograd node immediately reads duplicated weights.
         replay_done.wait()
         return grad_expert, grad_route_weights, None, None
