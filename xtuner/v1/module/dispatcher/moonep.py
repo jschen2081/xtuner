@@ -912,20 +912,6 @@ class _MoonEPExpertGradBridge(torch.autograd.Function):
         # so autograd delivers None here. The bridge still fires (via the
         # re-enabled dx) to trigger reduce_grad_bf16 + FSDP .grad writeback.
         gradients: ProjectionPair | None = None if ctx.x8_active else (dw13, dw2)
-        # ★ 2026-10-12 grad_reduce_xt 竞态规避 (默认关):
-        #   reduce_grad_bf16 的内核直读对端 rank 的 duplicate 梯度槽
-        #   (PR-3 direct read), 而对端 ``_GMMWithGradWeightOut.backward`` 的
-        #   ``gwo[b:].copy_`` 与本 rank 的直读之间**没有跨 rank 同步** —— 对端
-        #   写入可能尚未落 HBM, reduce 读到 stale 行。实测影响集中在 w1w3
-        #   (内核先读 proj0, 且 w1w3 是 reduce 前最后一次 GMM 写入, 行宽又大
-        #   一倍): 逐专家 dW1W3 比值散落 0.33~0.98, 汇总成 grad_norm 的
-        #   ~0.05% 系统性偏低。此处插入全 rank 屏障可恢复逐位一致
-        #   (实验: w1w3+w2 总平方和 0.9608 → 1.0001, grad_norm −0.049% →
-        #   −0.001%)。代价是每层一次 device 同步, 默认关; 根治需内核侧
-        #   (修 getmem 回退路径或加跨 rank 完成屏障)。
-        if ctx.x8_active and os.environ.get("MOONEP_REDUCE_SYNC", "0") == "1":
-            torch.npu.synchronize()
-            dist.barrier(cast(_MoonEPLayerCallState, ctx.call_state).resources.ep_group)
         start_gradient_completion(cast(_MoonEPLayerCallState, ctx.call_state), gradients)
         # dW is now owned by MoonEP; do not also accumulate it on anchor leaves.
         return grad_hidden, None, None, None
