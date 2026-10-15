@@ -649,7 +649,10 @@ def prepare_experts(state: _MoonEPLayerCallState, dispatched: MoonEPDispatchResu
         # The home prefix is a single accumulator shared across every micro-
         # batch of one FSDP call (same storage for every slot). Zero it once on
         # the first producer, on the forward stream, ahead of the backward add_.
-        if not state.layer_gradients.initialized:
+        # ★ 2026-10-15: first producer 时 GEMM dw 直写整块堆 (home==0 →
+        #   直写 == add_, dup 直写 == copy_), 省 ~8.4GB/层附加访存。
+        first_producer = not state.layer_gradients.initialized
+        if first_producer:
             for proj in (0, 1):
                 workspace.home_grad_view(grad_slot, proj).zero_()
             state.layer_gradients.initialized = True
@@ -664,6 +667,7 @@ def prepare_experts(state: _MoonEPLayerCallState, dispatched: MoonEPDispatchResu
         expert_weight_layout=ExpertWeightLayout(
             trainable_weights=(w13, w2),
             grad_weight_out=grad_weight_out,
+            grad_weight_first=first_producer if state.x8_active else False,
         ),
     )
 

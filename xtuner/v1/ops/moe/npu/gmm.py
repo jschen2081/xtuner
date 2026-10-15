@@ -73,16 +73,24 @@ class _GMMWithGradWeightOut(torch.autograd.Function):
     Forward: moonep_ops.npu_gmm.
     Backward: dx + dw via moonep_ops.npu_gmm_backward, dw written into
     grad_weight_out as home add_ + dup copy_.
+
+    ★ grad_weight_first (2026-10-15): 首个 producer 时 home 已由 dispatcher
+    在 forward 阶段 zero — GEMM dw 直写整块 gwo (home+dup) 语义等价
+    (0 + dw == add_; 覆写 == copy_), 省掉 dw 全量物化 + add_ + copy_
+    (~8.4GB/层 附加访存 → 零)。非首个 producer 回退 add_/copy_ 路径
+    (home 累加不可由覆写型 GEMM 表达)。
     """
 
     @staticmethod
-    def forward(ctx, x, weight, group_list, group_list_type, grad_weight_out):
+    def forward(ctx, x, weight, group_list, group_list_type, grad_weight_out,
+                grad_weight_first=False):
         outputs = moonep_ops.npu_gmm(x, weight, None, group_list, 0,
                                      group_list_type)
         ctx.save_for_backward(x, weight)
         ctx.group_list = group_list
         ctx.group_list_type = group_list_type
         ctx.grad_weight_out = grad_weight_out
+        ctx.grad_weight_first = bool(grad_weight_first)
         return outputs
 
     @staticmethod
@@ -93,8 +101,18 @@ class _GMMWithGradWeightOut(torch.autograd.Function):
         gwo = ctx.grad_weight_out
 
         if x.shape[0] == 0:
-            return None, None, None, None, None
+            return None, None, None, None, None, None
 
+        if getattr(ctx, "grad_weight_first", False):
+            # 首个 producer: home 已 zero (dispatcher forward 阶段) → GEMM
+            # dw 直写整块 gwo (转置 view [E,I,O] over [E,O,I] 堆布局):
+            # 零 dw 物化 / 零 add_ / 零 copy_。dw 返回值即 gwo view, 弃用。
+            dx, _dw = moonep_ops.npu_gmm_backward(
+                grad_output, x, weight, group_list, group_list_type,
+                dw_out=gwo.transpose(1, 2))
+            return dx, None, None, None, None, None
+
+        # 回退路径 (非首 producer): home 累加 → dw 物化 + add_ + dup copy_。
         # home/dup 拆分: gwo = [epn+B, O, I], epn==B → b = shape[0]//2。
         b = gwo.shape[0] // 2
 
@@ -103,16 +121,18 @@ class _GMMWithGradWeightOut(torch.autograd.Function):
         # group_gemm.py: weights.transpose(1,2) 喂入)。
         dx, dw = moonep_ops.npu_gmm_backward(grad_output, x, weight,
                                              group_list, group_list_type)
-        # dw [E,I,O] → 堆槽 [E,O,I] 非连续 view (零物化, 8.6GB/层 临时消除)
+        # dw [E,I,O] → 堆槽 [E,O,I] 非连续 view (零物化)
         dw = dw.transpose(1, 2)
 
         # 写堆: home 跨 micro-batch 共享累加器 → add_; dup slot-local → copy_。
+        # 不变量: dup copy_ 覆写语义依赖 planning _dedup_dst 的「每目标行
+        # 唯一写者」— 多写者则须改 add_, 直写前提消失。
         gwo[:b].add_(dw[:b])
         gwo[b:].copy_(dw[b:])
 
         # dx 重启用: X8 接线后 _MoonEPExpertGradBridge.backward 由 dx 流回
         # expert-block 输入触发 → start_gradient_completion → reduce_grad_bf16。
-        return dx, None, None, None, None
+        return dx, None, None, None, None, None
 
 
 def npu_gmm_param_verification(x, weight, *, bias=None, group_list=None,
@@ -161,7 +181,8 @@ def npu_gmm_v2(x, weight, *, bias=None, group_list=None, group_type=0,
 
 
 def npu_gmm_with_grad_weight_out(x, weight, *, group_list,
-                                 grad_weight_out=None, original_weight=None):
+                                 grad_weight_out=None, original_weight=None,
+                                 grad_weight_first=False):
     """GMM with optional grad_weight_out (MoonEP-Ascend path).
 
     grad_weight_out=None → 等同 npu_gmm (backward 兼容)。
@@ -173,4 +194,4 @@ def npu_gmm_with_grad_weight_out(x, weight, *, group_list,
     npu_gmm_param_verification(x, weight, bias=None, group_list=group_list,
                                group_type=0, group_list_type=0)
     return _GMMWithGradWeightOut.apply(x, weight, group_list, 0,
-                                       grad_weight_out)
+                                       grad_weight_out, grad_weight_first)

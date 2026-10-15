@@ -166,6 +166,7 @@ class GroupedLinear(nn.Module):
         *,
         trainable_weight: torch.Tensor | None = None,
         grad_weight_out: torch.Tensor | None = None,
+        grad_weight_first: bool = False,
     ):
         # A dynamic EP backend may supply a differentiable call-local alias.
         # ★ P3B (2026-09-20): grad_weight_out 非空时走 X8 (_GMMWithGradWeightOut)
@@ -178,7 +179,8 @@ class GroupedLinear(nn.Module):
         else:
             weight = trainable_weight
         out = group_gemm(x, weight, tokens_per_expert,
-                         grad_weight_out=grad_weight_out)
+                         grad_weight_out=grad_weight_out,
+                         grad_weight_first=grad_weight_first)
 
         if self.moe_bias:
             bias = self.bias.to_local() if isinstance(self.bias, DTensor) else self.bias

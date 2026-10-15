@@ -7,9 +7,12 @@ def npu_group_gemm(
     split_sizes: torch.Tensor,
     *,
     grad_weight_out: torch.Tensor | None = None,
+    grad_weight_first: bool = False,
 ) -> torch.Tensor:
     if os.environ.get("DISPATCHER", "all2all") == "moonep":
-        return npu_group_gemm_moonep(x, weights, split_sizes, grad_weight_out=grad_weight_out)
+        return npu_group_gemm_moonep(x, weights, split_sizes,
+                                     grad_weight_out=grad_weight_out,
+                                     grad_weight_first=grad_weight_first)
     else:
         return npu_group_gemm_mindspeed(x, weights, split_sizes)
 
@@ -25,6 +28,7 @@ def npu_group_gemm_moonep(
     split_sizes: torch.Tensor,
     *,
     grad_weight_out: torch.Tensor | None = None,
+    grad_weight_first: bool = False,
 ) -> torch.Tensor:
     """Grouped GEMM via MoonEP Ops.gmm (自研, 去 mindspeed) with grad_weight_out.
 
@@ -44,10 +48,17 @@ def npu_group_gemm_moonep(
     if grad_weight_out is not None:
         # ★ P3B (2026-09-20): grad_weight_out = [E,O,I] 堆槽直传 (X8 backward
         #   grad_t@x → [E,O,I] 直写, 无 transpose)。
+        # ★ 2026-10-15: grad_weight_first (dispatcher initialize 语义) 且
+        #   MOONEP_X8_DW≠0 → GEMM dw 直写整块堆 (零物化); 否则回退
+        #   dw 物化 + home add_ + dup copy_ (MOONEP_X8_DW=0 强制回退, A/B)。
         from .gmm import npu_gmm_with_grad_weight_out
+        direct = grad_weight_first and os.environ.get("MOONEP_X8_DW", "1") != "0"
+        if direct and os.environ.get("MOONEP_X8_DW_INFO", "0") == "1":
+            print("[x8-dw] GEMM dw direct-write ACTIVE", flush=True)
         return npu_gmm_with_grad_weight_out(
             x, weights_t, group_list=group_list,
             grad_weight_out=grad_weight_out, original_weight=None,
+            grad_weight_first=direct,
         )
     else:
         from .gmm import npu_gmm

@@ -35,6 +35,9 @@ class ExpertWeightLayout(NamedTuple):
 
     trainable_weights: ProjectionPair | None = None
     grad_weight_out: ProjectionPair | None = None
+    # ★ 2026-10-15: True = 本 FSDP call 首个 producer (home home_prefix 已
+    # zero) → GEMM dw 可直写整块堆 (语义 == add_/copy_), 零 dw 物化。
+    grad_weight_first: bool = False
 
 
 def _get_backward_pre_hook(backward_previous_event: torch.cuda.Event):
