@@ -79,11 +79,6 @@ class _GMMWithGradWeightOut(torch.autograd.Function):
     def forward(ctx, x, weight, group_list, group_list_type, grad_weight_out):
         outputs = moonep_ops.npu_gmm(x, weight, None, group_list, 0,
                                      group_list_type)
-        if int(os.environ.get("MOONEP_DBG_DWSHAPE", "0")):
-            print(f"[GMM-fwd] rank={torch.distributed.get_rank()} "
-                  f"out.norm={outputs.float().norm().item():.4f} "
-                  f"x.norm={x.float().norm().item():.4f} "
-                  f"x.shape={tuple(x.shape)}", flush=True)
         ctx.save_for_backward(x, weight)
         ctx.group_list = group_list
         ctx.group_list_type = group_list_type
@@ -110,14 +105,6 @@ class _GMMWithGradWeightOut(torch.autograd.Function):
                                              group_list, group_list_type)
         # dw [E,I,O] → 堆槽 [E,O,I] 非连续 view (零物化, 8.6GB/层 临时消除)
         dw = dw.transpose(1, 2)
-        if int(os.environ.get("MOONEP_DBG_DWSHAPE", "0")):
-            print(f"[X8-dbg] rank={torch.distributed.get_rank()} "
-                  f"dw.shape={tuple(dw.shape)} gwo.shape={tuple(gwo.shape)} "
-                  f"b={b} x.shape={tuple(x.shape)}", flush=True)
-            print(f"[X8-grad] rank={torch.distributed.get_rank()} "
-                  f"dw.norm={dw.float().norm().item():.6f} "
-                  f"dw[:b].norm={dw[:b].float().norm().item():.6f} "
-                  f"dw[b:].norm={dw[b:].float().norm().item():.6f}", flush=True)
 
         # 写堆: home 跨 micro-batch 共享累加器 → add_; dup slot-local → copy_。
         gwo[:b].add_(dw[:b])
