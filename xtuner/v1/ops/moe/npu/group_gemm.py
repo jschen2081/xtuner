@@ -48,17 +48,21 @@ def npu_group_gemm_moonep(
     if grad_weight_out is not None:
         # ★ P3B (2026-09-20): grad_weight_out = [E,O,I] 堆槽直传 (X8 backward
         #   grad_t@x → [E,O,I] 直写, 无 transpose)。
-        # ★ 2026-10-15: grad_weight_first (dispatcher initialize 语义) 且
-        #   MOONEP_X8_DW≠0 → GEMM dw 直写整块堆 (零物化); 否则回退
-        #   dw 物化 + home add_ + dup copy_ (MOONEP_X8_DW=0 强制回退, A/B)。
+        # ★ 2026-10-15: MOONEP_X8_DW 控制直写强度 (grad_weight_first 传递
+        #   dispatcher 的 home-zero 契约, 不再做门控):
+        #   0 = 全物化回退 (A/B); 1 (默认) = 首 producer 整块直写 (P1);
+        #   2 = P0 — 首 producer 整块直写 + 非首 producer dup 半区直写
+        #   + home 物化累加 (gmm.py 内分流)。
         from .gmm import npu_gmm_with_grad_weight_out
-        direct = grad_weight_first and os.environ.get("MOONEP_X8_DW", "1") != "0"
-        if direct and os.environ.get("MOONEP_X8_DW_INFO", "0") == "1":
-            print("[x8-dw] GEMM dw direct-write ACTIVE", flush=True)
+        dw_mode = os.environ.get("MOONEP_X8_DW", "1")
+        if dw_mode == "2" or (grad_weight_first and dw_mode != "0"):
+            if os.environ.get("MOONEP_X8_DW_INFO", "0") == "1":
+                print(f"[x8-dw] mode={dw_mode} active "
+                      f"(first={grad_weight_first})", flush=True)
         return npu_gmm_with_grad_weight_out(
             x, weights_t, group_list=group_list,
             grad_weight_out=grad_weight_out, original_weight=None,
-            grad_weight_first=direct,
+            grad_weight_first=grad_weight_first and dw_mode != "0",
         )
     else:
         from .gmm import npu_gmm

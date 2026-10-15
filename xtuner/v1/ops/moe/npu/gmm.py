@@ -77,8 +77,10 @@ class _GMMWithGradWeightOut(torch.autograd.Function):
     ★ grad_weight_first (2026-10-15): 首个 producer 时 home 已由 dispatcher
     在 forward 阶段 zero — GEMM dw 直写整块 gwo (home+dup) 语义等价
     (0 + dw == add_; 覆写 == copy_), 省掉 dw 全量物化 + add_ + copy_
-    (~8.4GB/层 附加访存 → 零)。非首个 producer 回退 add_/copy_ 路径
-    (home 累加不可由覆写型 GEMM 表达)。
+    (~8.4GB/层 附加访存 → 零)。非首个 producer 在 MOONEP_X8_DW=1 (默认) 下
+    回退 add_/copy_ 路径 (home 累加不可由覆写型 GEMM 表达);
+    MOONEP_X8_DW=2 (P0) 下非首 producer 走 dup 半区直写 + home 物化累加
+    (dup 直写 == copy_, producer 局部等价)。
     """
 
     @staticmethod
@@ -103,7 +105,12 @@ class _GMMWithGradWeightOut(torch.autograd.Function):
         if x.shape[0] == 0:
             return None, None, None, None, None, None
 
-        if getattr(ctx, "grad_weight_first", False):
+        # MOONEP_X8_DW: 0 = 全物化回退; 1 = 首 producer 整块直写 (P1, 默认);
+        #               2 = P0 — 首 producer 整块直写 + 非首 producer
+        #               dup 半区直写 + home 半区物化累加。
+        dw_mode = os.environ.get("MOONEP_X8_DW", "1")
+
+        if getattr(ctx, "grad_weight_first", False) and dw_mode != "0":
             # 首个 producer: home 已 zero (dispatcher forward 阶段) → GEMM
             # dw 直写整块 gwo (转置 view [E,I,O] over [E,O,I] 堆布局):
             # 零 dw 物化 / 零 add_ / 零 copy_。dw 返回值即 gwo view, 弃用。
@@ -112,7 +119,41 @@ class _GMMWithGradWeightOut(torch.autograd.Function):
                 dw_out=gwo.transpose(1, 2))
             return dx, None, None, None, None, None
 
-        # 回退路径 (非首 producer): home 累加 → dw 物化 + add_ + dup copy_。
+        if dw_mode == "2":
+            # ★ P0 (非首 producer): dup 半区 GEMM 直写 + home 半区物化累加。
+            #   home 跨 micro-batch 共享累加 → GEMM 物化 dw_home + add_;
+            #   dup slot-local, 每行都被本 producer 的 copy_ 写满 →
+            #   GEMM 直写 == copy_ (含空组行写 0, 无残留风险), producer 局部
+            #   等价, 不依赖跨 producer 不变量。
+            #   切分: x 的组序与堆行序一致 (先 home 组后 dup 组),
+            #   boundary = group_list[b-1] (home 组 token 总数)。
+            #   代价: 一次 .item() 同步取 boundary (见 env 注释, G>1 才走来)。
+            b = gwo.shape[0] // 2
+            boundary = int(group_list[b - 1].item())
+            # dx: 与 npu_gmm_backward 同式 (grad @ W^T, group_type=0 全 M 一组)
+            wt = weight.transpose(-1, -2)
+            dx = moonep_ops.npu_gmm(grad_output, wt, None, group_list, 0,
+                                    group_list_type)
+            # home dw: 物化 + add_ (跨 micro-batch 累加器, 不可覆写)
+            if boundary > 0:
+                xt_home = x[:boundary].transpose(-1, -2)
+                dw_home = moonep_ops.npu_gmm(xt_home, grad_output[:boundary],
+                                             None, group_list[:b], 2,
+                                             group_list_type)
+                gwo[:b].add_(dw_home.transpose(1, 2))
+            # dup dw: GEMM 直写 dup 半区 (空组行写 0 — 自洁, 等价 copy_)
+            if x.shape[0] - boundary > 0:
+                xt_dup = x[boundary:].transpose(-1, -2)
+                gl_dup = (group_list[b:] - boundary).contiguous()
+                moonep_ops.npu_gmm_moep([xt_dup], [grad_output[boundary:]],
+                                        None, gl_dup, 2, group_list_type,
+                                        gwo[b:].transpose(1, 2))
+            else:
+                gwo[b:].zero_()
+            return dx, None, None, None, None, None
+
+        # 回退路径 (dw_mode == "0", 或 "1" 下非首 producer):
+        # home 累加 → dw 物化 + add_ + dup copy_。
         # home/dup 拆分: gwo = [epn+B, O, I], epn==B → b = shape[0]//2。
         b = gwo.shape[0] // 2
 
