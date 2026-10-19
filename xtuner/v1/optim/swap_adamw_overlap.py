@@ -19,6 +19,17 @@ Knobs (independent, combinable):
                               step's fwd+bwd (step-end event).
   XTUNER_SWAP_H2D_OVERLAP=1  H2D on a copy stream one chunk ahead, overlapping
                               the current chunk's adam + D2H.
+  XTUNER_SWAP_FUSED_UPCAST   bf16-state H2D path (only meaningful with
+                              XTUNER_SWAP_BF16_STATE=1). 0 (default) = split:
+                              bf16 H2D into a bf16 temp, then a device cast to
+                              fp32 (12 bytes/elem live). 1 = fused: one fp32
+                              temp per tensor, the bf16->fp32 upcast folded into
+                              the H2D (8 bytes/elem live, but 2x H2D bytes and
+                              a synchronous copy that blocks the host under
+                              many-rank PCIe contention). 2 = async fused: one
+                              fp32 temp per tensor plus a persistent bf16
+                              staging buffer, H2D stays a non-blocking bf16
+                              copy (8 bytes/elem live, 1x H2D bytes).
 
 With no knob set, swap_adamw.step takes its stock serial path. Chunking
 (XTUNER_SWAP_OVERLAP_NCHUNKS, default 16) bounds per-chunk in-flight memory.
@@ -168,6 +179,11 @@ def step_overlap(
     bf16 = bool(int(os.environ.get("XTUNER_SWAP_BF16_STATE", "0")))
     d2h_ov = bool(int(os.environ.get("XTUNER_SWAP_D2H_OVERLAP", "0")))
     h2d_ov = bool(int(os.environ.get("XTUNER_SWAP_H2D_OVERLAP", "0")))
+    # 0 = original split path (default). 1 = sync fused upcast, 2 = async fused.
+    # Both fused modes only help while PYTORCH_NPU_ALLOC_CONF keeps
+    # expandable_segments:True; with expandable_segments:False they are neutral
+    # (mode 1 additionally moves 2x the H2D bytes). See the module docstring.
+    fused_upcast = int(os.environ.get("XTUNER_SWAP_FUSED_UPCAST", "0"))
 
     copy_s = getattr(optimizer, "_swap_copy_stream", None)
     if copy_s is None:
@@ -198,6 +214,17 @@ def step_overlap(
     nchunks = max(1, int(os.environ.get("XTUNER_SWAP_OVERLAP_NCHUNKS", "16")))
     nchunks = min(nchunks, n)
 
+    def bf16_stage(numel: int) -> torch.Tensor:
+        # Persistent flat bf16 staging buffer shared by every param in the step.
+        # Reused in stream order (copy_ bf16 in -> cast into the fp32 temp ->
+        # next param's copy_ bf16 in), so no cross-stream hazard and no
+        # per-param device allocation for the staging side.
+        buf = getattr(optimizer, "_swap_bf16_stage", None)
+        if buf is None or buf.numel() < numel:
+            buf = torch.empty(numel, dtype=torch.bfloat16, device=DEVICE)
+            optimizer._swap_bf16_stage = buf
+        return buf[:numel]
+
     def chunk_slice(ci: int) -> list:
         lo = round(ci * n / nchunks)
         hi = round((ci + 1) * n / nchunks)
@@ -223,18 +250,55 @@ def step_overlap(
 
             assert isinstance(cpu_exp_avg, torch.Tensor)
             assert isinstance(cpu_exp_avg_sq, torch.Tensor)
-            exp_avg = cpu_exp_avg.to(device=DEVICE, non_blocking=True)
-            exp_avg_sq = cpu_exp_avg_sq.to(device=DEVICE, non_blocking=True)
             max_exp_avg_sq = None
-            if amsgrad:
-                assert isinstance(cpu_max, torch.Tensor)
-                max_exp_avg_sq = cpu_max.to(device=DEVICE, non_blocking=True)
-
-            if bf16:
-                exp_avg = exp_avg.to(torch.float32)
-                exp_avg_sq = exp_avg_sq.to(torch.float32)
+            if bf16 and fused_upcast == 2:
+                # Async fused: one fp32 device temp per tensor, i.e. the same
+                # "few and large" device allocation pattern as mode 1 (which is
+                # what keeps the allocator's segment pool from collapsing), but
+                # the H2D is a plain non_blocking bf16 copy_ (11 GB) instead of
+                # a synchronous .to(npu, fp32) (22 GB) that blocks the host for
+                # seconds under 16-rank PCIe contention.
+                exp_avg = torch.empty(cpu_exp_avg.shape, dtype=torch.float32, device=DEVICE)
+                stage = bf16_stage(cpu_exp_avg.numel()).view(cpu_exp_avg.shape)
+                stage.copy_(cpu_exp_avg, non_blocking=True)
+                exp_avg.copy_(stage)
+                exp_avg_sq = torch.empty(cpu_exp_avg_sq.shape, dtype=torch.float32, device=DEVICE)
+                stage = bf16_stage(cpu_exp_avg_sq.numel()).view(cpu_exp_avg_sq.shape)
+                stage.copy_(cpu_exp_avg_sq, non_blocking=True)
+                exp_avg_sq.copy_(stage)
+                if amsgrad:
+                    assert isinstance(cpu_max, torch.Tensor)
+                    max_exp_avg_sq = torch.empty(cpu_max.shape, dtype=torch.float32, device=DEVICE)
+                    stage = bf16_stage(cpu_max.numel()).view(cpu_max.shape)
+                    stage.copy_(cpu_max, non_blocking=True)
+                    max_exp_avg_sq.copy_(stage)
+            elif bf16 and fused_upcast:
+                # Fuse the bf16->fp32 upcast into the H2D copy: a single fp32
+                # device temp per tensor instead of a bf16 temp plus an fp32
+                # temp. Halves the live device temp (12 -> 8 bytes/elem) and the
+                # allocator churn in this loop, which is where the multi-second
+                # host stalls (allocator sync/retry, no new blocks) come from.
+                exp_avg = cpu_exp_avg.to(device=DEVICE, dtype=torch.float32, non_blocking=True)
+                exp_avg_sq = cpu_exp_avg_sq.to(device=DEVICE, dtype=torch.float32, non_blocking=True)
+                if amsgrad:
+                    assert isinstance(cpu_max, torch.Tensor)
+                    max_exp_avg_sq = cpu_max.to(device=DEVICE, dtype=torch.float32, non_blocking=True)
+            else:
+                exp_avg = torch.empty_like(cpu_exp_avg, device=DEVICE)
+                exp_avg_sq = torch.empty_like(cpu_exp_avg_sq, device=DEVICE)
+                if amsgrad:
+                    assert isinstance(cpu_max, torch.Tensor)
+                    max_exp_avg_sq = torch.empty_like(cpu_max, device=DEVICE)
+                exp_avg.copy_(cpu_exp_avg, non_blocking=True)
+                exp_avg_sq.copy_(cpu_exp_avg_sq, non_blocking=True)
                 if max_exp_avg_sq is not None:
-                    max_exp_avg_sq = max_exp_avg_sq.to(torch.float32)
+                    max_exp_avg_sq.copy_(cpu_max, non_blocking=True)
+
+                if bf16:
+                    exp_avg = exp_avg.to(torch.float32)
+                    exp_avg_sq = exp_avg_sq.to(torch.float32)
+                    if max_exp_avg_sq is not None:
+                        max_exp_avg_sq = max_exp_avg_sq.to(torch.float32)
 
             entries.append(
                 {
