@@ -300,6 +300,50 @@ class TrainEngine:
             _t.save(_dump, _dump_path)
             print(f"[GRAD-DUMP] rank0 saved {list(_dump.keys())} → {_dump_path}", flush=True)
 
+        if os.environ.get("MOONEP_GRAD_PROBE", "0") == "1" and torch.distributed.is_initialized():
+            # ★ 逐参数梯度探查 (2026-10-20): grad_norm 偶发尖峰时定位是哪个参数张量。
+            #   本地分片 L2 norm → 全局 MAX (只为定位, 非严格范数) → rank0 打印 top5
+            #   + top1 的全局 max|g| (量级可判别「垃圾 bf16」vs「真实大梯度」)。
+            _pnames = [n for n, p in self.model.trainable_parameters() if p.grad is not None]
+            _plocals = [g.to_local() if hasattr(g, "to_local") else g for g in all_grads]
+            if _plocals:
+                _pnorms = torch.stack(
+                    [n.reshape(()).float() for n in torch._foreach_norm(_plocals, 2.0, dtype=dtype)]
+                )
+                torch.distributed.all_reduce(_pnorms, op=torch.distributed.ReduceOp.MAX)
+                _k = min(5, _pnorms.numel())
+                _tvals, _tidx = torch.topk(_pnorms, _k)
+                _i0 = int(_tidx[0])
+                _l0 = _plocals[_i0]
+                _m0 = _l0.abs().max().float() if _l0.numel() > 0 else torch.zeros((), dtype=torch.float32)
+                torch.distributed.all_reduce(_m0, op=torch.distributed.ReduceOp.MAX)
+                if torch.distributed.get_rank() == 0:
+                    _gn = total_grad_norm.to_local() if hasattr(total_grad_norm, "to_local") else total_grad_norm
+                    # ★ 2026-10-20: 计数「被抬高的参数个数」——单个 MoE 层坏掉
+                    #   时只有该层及其下游参数量级被抬高, 全层坏掉则几乎所有
+                    #   参数都 >1。nbig 一眼区分「单层注入」vs「全局放大」。
+                    _nbig = int((_pnorms > 1.0).sum())
+                    _desc = ", ".join(
+                        f"{_pnames[int(i)]}={float(v):.4g}" for v, i in zip(_tvals, _tidx)
+                    )
+                    print(
+                        f"[GRADPROBE] grad_norm={float(_gn):.6f} maxabs={float(_m0):.4g} "
+                        f"nbig={_nbig}/{_pnorms.numel()} top{_k}: {_desc}",
+                        flush=True,
+                    )
+                    if float(_pnorms.max()) > 10.0:
+                        # 尖峰步全量 dump (只 rank0, 只污染步) — 用于判定
+                        # 「所有 gate 都被抬高」还是「某一层的 gate」。
+                        try:
+                            _allv, _alli = torch.topk(_pnorms, _pnorms.numel())
+                            with open("/tmp/gradprobe_dump.log", "a") as _f:
+                                _f.write(f"=== grad_norm={float(_gn):.6f} nbig={_nbig}"
+                                         f"/{_pnorms.numel()} maxabs={float(_m0):.4g}\n")
+                                for _v, _i in zip(_allv.tolist(), _alli.tolist()):
+                                    _f.write(f"  {_pnames[int(_i)]}={_v:.6g}\n")
+                        except Exception as _e:      # 诊断代码不得影响训练
+                            print(f"[GRADPROBE] dump failed: {_e}", flush=True)
+
         if do_clip:
             clip_param_ids = {
                 id(p) for group in self.optimizer.param_groups if group.get("clip_grad", True) for p in group["params"]
