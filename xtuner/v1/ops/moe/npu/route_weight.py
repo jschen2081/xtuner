@@ -4,12 +4,14 @@ Replaces the Triton kernel with pure PyTorch ops. The computation is
 element-wise row scaling — no custom kernel needed:
 
   grad_expert[row] = (grad_weighted[row] * route_weight[row]).to(bf16)
-  grad_route[row]  = sum_over_hidden(
-      (grad_weighted[row] * expert_output[row]).to(bf16).to(fp32)
-  )
+  grad_route[row]  = sum_over_hidden(grad_weighted[row] * expert_output[row])
 
-The bf16 intermediate rounding matches the Triton kernel's semantics
-("each route-gradient product is rounded before its FP32 reduction").
+Both are computed in FP32 end to end (only the grad_expert output is rounded
+to bf16). This matches the all2all baseline, whose merge backward keeps FP32
+for both `w` and the route-weight reduction (dP agrees with a bare FP32
+reference to ~1e-7). The earlier bf16 intermediate rounding, copied from the
+Triton kernel, cost 2.8e-3 on dX and 1.7e-3 on dP, and its hardware
+round-half-away ties disagree with torch's RNE on ~1/256 of the products.
 
 ★ Memory-lean chunked implementation: peak transient memory is one chunk's
 rows (~MBs) instead of N full-width fp32 copies — the unchunked version
@@ -38,9 +40,9 @@ def route_weight_rows_backward(
         route_weights: [num_tokens] fp32, contiguous.
 
     Returns:
-        grad_expert: [num_tokens, H] bf16 — grad_weighted * route_weight (rounded).
+        grad_expert: [num_tokens, H] bf16 — grad_weighted * route_weight (rounded to bf16).
         grad_route: [num_tokens] fp32 — sum(grad_weighted * expert_output) per row,
-            with bf16 intermediate rounding before fp32 reduction.
+            accumulated in fp32.
     """
     assert grad_weighted.dtype is torch.bfloat16 and grad_weighted.is_contiguous()
     assert expert_output.dtype is torch.bfloat16 and expert_output.is_contiguous()
@@ -50,8 +52,7 @@ def route_weight_rows_backward(
 
     num_tokens, H = grad_weighted.shape
 
-    # route_weight: fp32 → bf16 → fp32 (match Triton kernel's rounding)
-    rw = route_weights.to(torch.bfloat16).to(torch.float32)  # [num_tokens]
+    rw = route_weights  # fp32, unquantized
 
     grad_expert = torch.empty_like(grad_weighted)
     grad_route = torch.empty(num_tokens, dtype=torch.float32, device=grad_weighted.device)
@@ -70,9 +71,8 @@ def route_weight_rows_backward(
             gw.to(torch.float32) * rw[start:end].unsqueeze(-1)
         ).to(torch.bfloat16)
 
-        # grad_route chunk = sum over hidden of (gw*eo).to(bf16).to(fp32)
-        # Match Triton: each product rounded to bf16 before fp32 accumulation
-        product = (gw.to(torch.float32) * eo.to(torch.float32)).to(torch.bfloat16).to(torch.float32)
+        # grad_route chunk = sum over hidden of (gw*eo), fp32 throughout
+        product = gw.to(torch.float32) * eo.to(torch.float32)
         grad_route[start:end] = product.sum(dim=-1)
 
     return grad_expert, grad_route
