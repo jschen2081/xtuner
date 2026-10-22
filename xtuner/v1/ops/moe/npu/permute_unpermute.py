@@ -1,3 +1,4 @@
+import os
 from typing import Tuple
 
 import torch
@@ -30,5 +31,8 @@ def npu_token_unpermute(
     from torch_npu import npu_moe_token_unpermute
 
     if probs is not None:
-        probs = probs.to(torch.bfloat16)
+        if not os.environ.get("XT_UNPERMUTE_FP32"):
+            # ★ 2026-10-21 诊断 (默认关): XT_UNPERMUTE_FP32=1 时保留 fp32 权重, 不量化成 bf16,
+            #   用于验证「base 前向 combine 的 bf16 量化是否就是 base-vs-MoonEP L0 差异的来源」。
+            probs = probs.to(torch.bfloat16)
     return npu_moe_token_unpermute(input_act, row_id_map, probs=probs)
