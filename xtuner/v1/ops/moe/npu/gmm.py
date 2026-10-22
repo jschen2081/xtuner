@@ -110,14 +110,28 @@ class _GMMWithGradWeightOut(torch.autograd.Function):
         #               2 = P0 — 首 producer 整块直写 + 非首 producer
         #               dup 半区直写 + home 半区物化累加。
         dw_mode = os.environ.get("MOONEP_X8_DW", "1")
+        # B1 (2026-10-22): dw 直写改走「交换 A/B + 连续 out」, 消除
+        # aclnnGroupedMatmulV4 为转置 view out 插入的内部 Transpose 物化。
+        # 置 0 回退旧写法 (转置 view out), 用于同库 A/B 对拍。
+        dw_swap = os.environ.get("MOONEP_GMM_DW_SWAP", "1") != "0"
 
         if getattr(ctx, "grad_weight_first", False) and dw_mode != "0":
-            # 首个 producer: GEMM dw 直写整块 gwo, 覆写含空组行的全部 2B 行
-            # (转置 view [E,I,O] over [E,O,I] 堆布局):
-            # 零 dw 物化 / 零 add_ / 零 copy_。dw 返回值即 gwo view, 弃用。
-            dx, _dw = moonep_ops.npu_gmm_backward(
-                grad_output, x, weight, group_list, group_list_type,
-                dw_out=gwo.transpose(1, 2))
+            # 首个 producer: GEMM dw 直写整块 gwo, 覆写含空组行的全部 2B 行。
+            # dw 按 (x^T @ grad)^T == grad^T @ x 反向组织, 直接产出堆槽布局
+            # [E,O,I] 的连续 out — 省掉「写转置 view → CANN 内部 Transpose
+            # 物化」那一步 (实测 40×(0.57+0.26) ms/步, 两条路径逐比特一致)。
+            # 零 dw 物化 / 零 add_ / 零 copy_。
+            if dw_swap:
+                wt = weight.transpose(-1, -2)
+                dx = moonep_ops.npu_gmm(grad_output, wt, None, group_list, 0,
+                                        group_list_type)
+                moonep_ops.npu_gmm_moep([grad_output.transpose(-1, -2)], [x],
+                                        None, group_list, 2, group_list_type,
+                                        gwo)
+            else:  # A/B 对拍用: 改动前原样 (转置 view out, CANN 内部插 Transpose)
+                dx, _dw = moonep_ops.npu_gmm_backward(
+                    grad_output, x, weight, group_list, group_list_type,
+                    dw_out=gwo.transpose(1, 2))
             return dx, None, None, None, None, None
 
         if dw_mode == "2":
@@ -136,19 +150,31 @@ class _GMMWithGradWeightOut(torch.autograd.Function):
             dx = moonep_ops.npu_gmm(grad_output, wt, None, group_list, 0,
                                     group_list_type)
             # home dw: 物化 + add_ (跨 micro-batch 累加器, 不可覆写)
+            # ★ B1: 同首 producer, 交换 A/B 让 dw_home 直接是 [b,O,I] 连续,
+            #   add_ 走连续读写 (免 stride 读 + 免内部 Transpose 物化)。
             if boundary > 0:
-                xt_home = x[:boundary].transpose(-1, -2)
-                dw_home = moonep_ops.npu_gmm(xt_home, grad_output[:boundary],
-                                             None, group_list[:b], 2,
-                                             group_list_type)
-                gwo[:b].add_(dw_home.transpose(1, 2))
+                if dw_swap:
+                    dw_home = moonep_ops.npu_gmm(
+                        grad_output[:boundary].transpose(-1, -2), x[:boundary],
+                        None, group_list[:b], 2, group_list_type)
+                else:  # A/B 对拍用: 旧写法, dw_home 是 [b,I,O] 再转置 add_
+                    dw_home = moonep_ops.npu_gmm(
+                        x[:boundary].transpose(-1, -2), grad_output[:boundary],
+                        None, group_list[:b], 2, group_list_type).transpose(1, 2)
+                gwo[:b].add_(dw_home)
             # dup dw: GEMM 直写 dup 半区 (空组行写 0 — 自洁, 等价 copy_)
             if x.shape[0] - boundary > 0:
-                xt_dup = x[boundary:].transpose(-1, -2)
                 gl_dup = (group_list[b:] - boundary).contiguous()
-                moonep_ops.npu_gmm_moep([xt_dup], [grad_output[boundary:]],
-                                        None, gl_dup, 2, group_list_type,
-                                        gwo[b:].transpose(1, 2))
+                if dw_swap:
+                    moonep_ops.npu_gmm_moep(
+                        [grad_output[boundary:].transpose(-1, -2)],
+                        [x[boundary:]], None, gl_dup, 2, group_list_type,
+                        gwo[b:])
+                else:  # A/B 对拍用: 旧写法, 转置 view out
+                    moonep_ops.npu_gmm_moep(
+                        [x[boundary:].transpose(-1, -2)],
+                        [grad_output[boundary:]], None, gl_dup, 2,
+                        group_list_type, gwo[b:].transpose(1, 2))
             else:
                 gwo[b:].zero_()
             return dx, None, None, None, None, None
