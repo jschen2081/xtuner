@@ -478,10 +478,10 @@ class _ExpertVMMWorkspace:
         then sums the EP partials without dividing.
 
         X8 path (``x8=True``): ``gradients`` is None — dW was already written
-        into the heap by ``_GMMWithGradWeightOut`` (home ``add_`` + dup
-        ``copy_``) and the home was zeroed in ``prepare_experts``. Skip the
-        zero/add_/copy_ block and only run ``reduce_grad_bf16`` over the slot's
-        heap views, then return the home slices.
+        into the heap by ``_GMMWithGradWeightOut`` (first producer overwrites
+        the whole slot, later producers ``add_``). Skip the zero/add_/copy_
+        block and only run ``reduce_grad_bf16`` over the slot's heap views,
+        then return the home slices.
         """
         if not 0 <= grad_slot < self._gradient_slots:
             raise ValueError(f"gradient slot out of range: {grad_slot}")

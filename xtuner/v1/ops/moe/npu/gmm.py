@@ -74,11 +74,12 @@ class _GMMWithGradWeightOut(torch.autograd.Function):
     Backward: dx + dw via moonep_ops.npu_gmm_backward, dw written into
     grad_weight_out as home add_ + dup copy_.
 
-    ★ grad_weight_first (2026-10-15): 首个 producer 时 home 已由 dispatcher
-    在 forward 阶段 zero — GEMM dw 直写整块 gwo (home+dup) 语义等价
-    (0 + dw == add_; 覆写 == copy_), 省掉 dw 全量物化 + add_ + copy_
-    (~8.4GB/层 附加访存 → 零)。非首个 producer 在 MOONEP_X8_DW=1 (默认) 下
-    回退 add_/copy_ 路径 (home 累加不可由覆写型 GEMM 表达);
+    ★ grad_weight_first (2026-10-15): 首个 producer 的 GEMM dw 直写覆写整块
+    gwo (home+dup, 空组行写 0) — 覆写 == add_ (home 初值) 且 == copy_ (dup),
+    省掉 dw 全量物化 + add_ + copy_ (~8.4GB/层 附加访存 → 零), 同时免掉
+    dispatcher 的 home 预清零 (2026-10-22)。
+    非首个 producer 在 MOONEP_X8_DW=1 (默认) 下回退 add_/copy_ 路径
+    (home 累加不可由覆写型 GEMM 表达);
     MOONEP_X8_DW=2 (P0) 下非首 producer 走 dup 半区直写 + home 物化累加
     (dup 直写 == copy_, producer 局部等价)。
     """
@@ -111,8 +112,8 @@ class _GMMWithGradWeightOut(torch.autograd.Function):
         dw_mode = os.environ.get("MOONEP_X8_DW", "1")
 
         if getattr(ctx, "grad_weight_first", False) and dw_mode != "0":
-            # 首个 producer: home 已 zero (dispatcher forward 阶段) → GEMM
-            # dw 直写整块 gwo (转置 view [E,I,O] over [E,O,I] 堆布局):
+            # 首个 producer: GEMM dw 直写整块 gwo, 覆写含空组行的全部 2B 行
+            # (转置 view [E,I,O] over [E,O,I] 堆布局):
             # 零 dw 物化 / 零 add_ / 零 copy_。dw 返回值即 gwo view, 弃用。
             dx, _dw = moonep_ops.npu_gmm_backward(
                 grad_output, x, weight, group_list, group_list_type,

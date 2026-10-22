@@ -647,14 +647,16 @@ def prepare_experts(state: _MoonEPLayerCallState, dispatched: MoonEPDispatchResu
         workspace = state.resources.workspace
         grad_slot = state.grad_slot
         # The home prefix is a single accumulator shared across every micro-
-        # batch of one FSDP call (same storage for every slot). Zero it once on
-        # the first producer, on the forward stream, ahead of the backward add_.
-        # ★ 2026-10-15: first producer 时 GEMM dw 直写整块堆 (home==0 →
-        #   直写 == add_, dup 直写 == copy_), 省 ~8.4GB/层附加访存。
+        # batch of one FSDP call (same storage for every slot).
+        # ★ 2026-10-22: first producer 的 GEMM dw 直写会覆写整块堆的每一行
+        #   (空组行写 0 — ops/tests 探针验证 garbage-heap == zero-heap), 因此
+        #   home 无需预清零: producer 1 覆写其余 add_ 累加即为正确和。仅
+        #   MOONEP_X8_DW=0 (全物化回退, home 走 add_) 仍需预清零。
         first_producer = not state.layer_gradients.initialized
         if first_producer:
-            for proj in (0, 1):
-                workspace.home_grad_view(grad_slot, proj).zero_()
+            if os.environ.get("MOONEP_X8_DW", "1") == "0":
+                for proj in (0, 1):
+                    workspace.home_grad_view(grad_slot, proj).zero_()
             state.layer_gradients.initialized = True
         grad_weight_out = (
             workspace.grad_view(grad_slot, 0),
@@ -856,9 +858,10 @@ def start_gradient_completion(state: _MoonEPLayerCallState, gradients: Projectio
     with torch.profiler.record_function("MoonEP::gradient_handoff"):
         # The workspace owns the ``B`` split, the home-prefix zero-or-add, the
         # duplicate-suffix copy, and the EP exact-sum reduction. ``initialize``
-        # is the call-local flag the Dispatcher owns (ADR-0027). On X8 the
-        # home was already zeroed in ``prepare_experts`` and dW written by the
-        # GEMM, so return_expert_gradients skips those and only reduces.
+        # is the call-local flag the Dispatcher owns (ADR-0027). On X8 dW was
+        # written by the GEMM (first producer overwrites the whole slot, later
+        # producers add_ it), so return_expert_gradients skips zero/add_/copy_
+        # and only reduces.
         home_grads, done = resources.enqueue(
             lambda: resources.workspace.return_expert_gradients(
                 buffer=resources.buffer,
@@ -906,6 +909,11 @@ class _MoonEPExpertGradBridge(torch.autograd.Function):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         ctx.call_state = call_state
         ctx.x8_active = call_state.x8_active
+        # ★ 2026-10-22: w13/w2 的 dW 在 X8 下由 _GMMWithGradWeightOut 直写堆,
+        #   这里必然收到 None。默认的 materialize_grads 会为每个未定义梯度
+        #   分配并清零一份全尺寸 zeros_like (2B,O,I) — 每步 40×(268MB+134MB)
+        #   纯浪费。关掉后 backward 直接拿到 None (X8 分支本就不看 dw)。
+        ctx.set_materialize_grads(False)
         return hidden_states, w13, w2
 
     @staticmethod
