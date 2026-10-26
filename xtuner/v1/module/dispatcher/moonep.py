@@ -544,6 +544,15 @@ class MoonEPPostCombineResult(TypedDict):
     hidden_states: torch.Tensor  # [S, H].
 
 
+def _prefetch_parallel_enabled() -> bool:
+    """Whether weight prefetch runs concurrently with dispatch on its own stream.
+
+    Read per call rather than cached so a single-process A/B does not need a
+    restart; the environment is consulted once per routed layer.
+    """
+    return os.environ.get("MOONEP_PREFETCH_PARALLEL", "0") == "1"
+
+
 @dataclass
 class _MoonEPLayerGradients:
     """One FSDP call's initialization state, never shared across replay calls.
@@ -693,6 +702,24 @@ def dispatch_forward(
         # Its call position (before dispatch's device barrier) is part of this
         # sequence, not an implicit precondition of a mode branch.
         state.home_parameters = resources.landing.prepare(layer=state.layer, generation=state.generation)
+
+        def start_prefetch(plan: Any) -> Any:
+            """Launch the weight prefetch on the dedicated stream.
+
+            Called by ``dispatch`` once the plan is final but before its kernel
+            is launched, which is the only window where the transfer can run
+            concurrently with dispatch. It reads ``plan.experts_to_copy`` and
+            the home weights — both ready before that kernel — and writes the
+            home window, which dispatch never touches.
+            """
+            return resources.workspace.start_prefetch(
+                buffer=buffer,
+                plan=plan,
+                generation=state.generation,
+                stream=buffer.prefetch_stream,
+            )
+
+        prefetch_parallel = _prefetch_parallel_enabled()
         hidden_nvsh, route_weights_nvs, cu_seqlens, plan = buffer.dispatch(
             source_hidden,
             route_weights_sk=source_route_weights,
@@ -700,17 +727,24 @@ def dispatch_forward(
             tokens_per_expert=tokens_per_expert,
             async_finish=False,
             zero_copy=False,
+            # ``None`` keeps the serial path: dispatch, then prefetch.
+            prefetch_hook=start_prefetch if prefetch_parallel else None,
         )
         assert route_weights_nvs is not None and cu_seqlens is not None
         state.plan = plan
         state.dispatch_done = torch.cuda.current_stream().record_event()
         # Only local weights are returned now; the gradient slot views are
         # created inside ``return_expert_gradients`` when they are needed.
-        state.local_weights = resources.workspace.prefetch_weights(
-            buffer=buffer,
-            plan=plan,
-            generation=state.generation,
-        )
+        if prefetch_parallel:
+            # The transfer already ran concurrently; dispatch joined it before
+            # returning, so the aliases are safe to hand out directly.
+            state.local_weights = resources.workspace.local_weights(generation=state.generation)
+        else:
+            state.local_weights = resources.workspace.prefetch_weights(
+                buffer=buffer,
+                plan=plan,
+                generation=state.generation,
+            )
         return hidden_nvsh, route_weights_nvs, cu_seqlens
 
     with torch.profiler.record_function("MoonEP::dispatch_forward"):
@@ -805,18 +839,31 @@ def combine_backward(state: _MoonEPLayerCallState, grad_output: torch.Tensor) ->
             for replay, forward in zip(replay_home_parameters, state.home_parameters, strict=True)
         ):
             raise RuntimeError("MoonEP backward observed a different FSDP unsharded Parameter")
+
+        def start_prefetch(plan: Any) -> Any:
+            """Backward's weight replay, launched to run alongside dispatch."""
+            return resources.workspace.start_prefetch(
+                buffer=buffer,
+                plan=plan,
+                generation=state.generation,
+                stream=buffer.prefetch_stream,
+            )
+
+        prefetch_parallel = _prefetch_parallel_enabled()
         grad_weighted, no_weights, no_cu, reused_plan = buffer.dispatch(
             grad_output,
             plan=state.plan,
             async_finish=False,
             zero_copy=False,
+            prefetch_hook=start_prefetch if prefetch_parallel else None,
         )
         # ★ Ascend buffer.dispatch 无条件返回 cu_seqlens (plan 的视图, 非 None),
         #   权重在 plan 复用模式下也不产出 — 断言只锁 plan 身份 (数据面正确性:
         #   grad_weighted 按 state.plan 的 dst 打包, 复用同一 plan 即正确)。
         assert no_weights is None and reused_plan is state.plan
         gradient_dispatch_done = torch.cuda.current_stream().record_event()
-        resources.workspace.prefetch_weights(buffer=buffer, plan=state.plan, generation=state.generation)
+        if not prefetch_parallel:
+            resources.workspace.prefetch_weights(buffer=buffer, plan=state.plan, generation=state.generation)
         return grad_weighted, gradient_dispatch_done
 
     with torch.profiler.record_function("MoonEP::combine_backward"):

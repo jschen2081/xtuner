@@ -444,19 +444,66 @@ class _ExpertVMMWorkspace:
         counts = torch.cat((counts[:-1], counts[-1:] + hidden_nvsh.shape[0] - covered))
         return hidden, counts
 
-    def prefetch_weights(self, *, buffer: Any, plan: Any, generation: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def local_weights(self, *, generation: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """This generation's local ``[2B]`` compute aliases — a pure view.
+
+        Split out of :meth:`prefetch_weights` so a caller that launches the
+        prefetch itself (and only needs the aliases afterwards) does not issue
+        the transfer twice.
+        """
+        return cast(tuple[torch.Tensor, torch.Tensor], self._views["local_weights"][generation])
+
+    def start_prefetch(
+        self,
+        *,
+        buffer: Any,
+        plan: Any,
+        generation: int,
+        stream: Any = None,
+    ) -> Any:
+        """Launch the weight prefetch without touching the launching stream.
+
+        Unlike :meth:`prefetch_weights` this does not return the compute
+        aliases — it hands back the completion event so a caller can run the
+        transfer concurrently with its own work and join later.
+        """
+        return buffer.prefetch_weight(
+            plan=plan,
+            projections=self._views["global_weights"][generation],
+            generation=generation,
+            async_finish=True,
+            stream=stream,
+        )
+
+    def prefetch_weights(
+        self,
+        *,
+        buffer: Any,
+        plan: Any,
+        generation: int,
+        async_finish: bool = False,
+        stream: Any = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Prefetch the global ``[E+B]`` weights and return this generation's
         local ``[2B]`` compute aliases.
 
         ``buffer`` is the MoonEP ``Buffer`` and ``plan`` its opaque plan
         object; both stay untyped MoonEP-owned values.
+
+        Args:
+            async_finish (bool): Launch on ``stream`` and return immediately
+                instead of blocking the launching stream.
+            stream (Any): Target stream when ``async_finish`` is set; ``None``
+                leaves the choice to the buffer (its comm stream).
         """
         buffer.prefetch_weight(
             plan=plan,
             projections=self._views["global_weights"][generation],
-            async_finish=False,
+            generation=generation,
+            async_finish=async_finish,
+            stream=stream,
         )
-        return cast(tuple[torch.Tensor, torch.Tensor], self._views["local_weights"][generation])
+        return self.local_weights(generation=generation)
 
     def return_expert_gradients(
         self,
