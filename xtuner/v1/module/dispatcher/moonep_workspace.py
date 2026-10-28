@@ -19,6 +19,66 @@ import torch
 import torch.distributed as dist
 from typing_extensions import TypedDict
 
+try:  # MoonEP Ascend 算子包；未安装时退化为纯 torch 路径
+    import moonep_ops
+except ImportError:  # pragma: no cover - 仅在无 Ascend 算子的环境触发
+    moonep_ops = None  # type: ignore[assignment]
+
+
+def _masked_copy_aiv() -> int:
+    """AIV block count for the masked-copy kernel (``MOONEP_MASKED_COPY_AIV``).
+
+    The kernel replaces ``hidden_nvsh * row_is_covered``, an ``aclnnMul`` whose
+    block_dim is fixed at every AIV.  On Ascend a full-core kernel cannot start
+    while a MoonEP collective still holds any core, so the multiply waits for
+    the whole dispatch to retire; interleaving micro-batches then pushes one
+    micro-batch's experts GEMM behind the other's dispatch.  Sizing this kernel
+    below the free-core budget lets it overlap instead.
+    """
+    try:
+        value = int(os.environ.get("MOONEP_MASKED_COPY_AIV", "16"))
+    except ValueError:
+        return 16
+    return max(1, value)
+
+
+def _masked_copy_enabled() -> bool:
+    """Whether the masked copy runs on the MoonEP kernel instead of ``mul``.
+
+    Off by default: the kernel buys overlap only when micro-batches interleave
+    (``MOONEP_ASYNC_PARALLEL=1``), and on its own the reduced parallelism makes
+    the copy slower than the full-core multiply.
+    """
+    if moonep_ops is None or not hasattr(moonep_ops, "masked_copy"):
+        return False
+    return os.environ.get("MOONEP_MASKED_COPY", "0") == "1"
+
+
+class _MaskedCopy(torch.autograd.Function):
+    """``dst = src`` over the covered prefix and zeros past it.
+
+    Bit-identical to ``src * row_is_covered`` (the mask is 0/1, so the bf16
+    product is exact) except that a non-finite padding row becomes 0 rather
+    than staying non-finite.  Forward and backward both use the MoonEP kernel,
+    which keeps both directions inside the configurable block budget.
+    """
+
+    @staticmethod
+    def forward(ctx: Any, src: torch.Tensor, covered: torch.Tensor, nblk: int) -> torch.Tensor:
+        dst = torch.empty_like(src)
+        moonep_ops.masked_copy(dst, src, covered, nblk)
+        ctx.save_for_backward(covered)
+        ctx.nblk = nblk
+        return dst
+
+    @staticmethod
+    def backward(ctx: Any, grad: torch.Tensor) -> tuple[torch.Tensor | None, None, None]:
+        (covered,) = ctx.saved_tensors
+        source = grad if grad.is_contiguous() else grad.contiguous()
+        out = torch.empty_like(source)
+        moonep_ops.masked_copy(out, source, covered, ctx.nblk)
+        return out, None, None
+
 
 # Shape legend used by every workspace structure below:
 #   E: global experts, R: EP ranks, B=E/R: home experts per rank,
@@ -439,9 +499,16 @@ class _ExpertVMMWorkspace:
         _ = self._views
         counts = self._local_token_counts(cu_seqlens)
         covered = counts.sum()
-        row_is_covered = torch.arange(hidden_nvsh.shape[0], device=hidden_nvsh.device) < covered
-        hidden = hidden_nvsh * row_is_covered.unsqueeze(-1)
-        counts = torch.cat((counts[:-1], counts[-1:] + hidden_nvsh.shape[0] - covered))
+        n_rows = hidden_nvsh.shape[0]
+        if _masked_copy_enabled():
+            # ``MOONEP_MASKED_COPY=1``: same values as the multiply below, but
+            # on a bounded block count so it can overlap a neighbouring
+            # micro-batch's dispatch instead of queueing behind it.
+            hidden = _MaskedCopy.apply(hidden_nvsh, covered.to(torch.int32), _masked_copy_aiv())
+        else:
+            row_is_covered = torch.arange(n_rows, device=hidden_nvsh.device) < covered
+            hidden = hidden_nvsh * row_is_covered.unsqueeze(-1)
+        counts = torch.cat((counts[:-1], counts[-1:] + n_rows - covered))
         return hidden, counts
 
     def local_weights(self, *, generation: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -539,6 +606,13 @@ class _ExpertVMMWorkspace:
             # dW already in the heap (home add_ + dup copy_ by the GEMM); the
             # home was zeroed on the first producer in prepare_experts. Only
             # run the EP exact-sum reduction over the slot's full views.
+            #
+            # 2026-10-27: making this async was measured and reverted -- it
+            # removes ~11 ms of host blocking per call (40 calls/step) but the
+            # step time did not move (3-round interleaved A/B: 5.53 s vs 5.47 s,
+            # inside the +-6% run-to-run noise). The host still has slack here,
+            # so keep the simpler synchronous contract for this numerically
+            # critical reduction.
             buffer.reduce_grad_bf16(
                 plan=plan,
                 local_grads=slot_views,

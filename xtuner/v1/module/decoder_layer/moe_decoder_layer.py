@@ -55,6 +55,33 @@ RouterTopKIds: TypeAlias = torch.Tensor
 HiddenStates: TypeAlias = torch.Tensor
 
 
+def _intra_layer_interleave_enabled() -> bool:
+    """Whether in-layer micro-batches pipeline dispatch against experts GEMM.
+
+    ``MOONEP_ASYNC_PARALLEL=1`` submits micro-batch ``i``'s routed dispatch and
+    then immediately issues micro-batch ``i-1``'s postprocess + experts GEMM, so
+    the AIV dispatch runs while the Cube GEMM of the previous micro-batch runs
+    on the compute stream.
+
+    Issuing the compute only after *every* dispatch has been submitted is not
+    enough on Ascend: the plan ends in a small D2H that blocks the host until
+    the preceding dispatch kernel has retired, so the GEMMs would all be
+    submitted after the dispatches already finished on device and nothing would
+    overlap. Handing the previous micro-batch's compute to the host during that
+    wait costs it almost nothing (no D2H there) and is what makes the overlap
+    real.
+
+    Only the *dispatch* is reordered. The routed weight prefetch is the one part
+    of ``dispatch`` with a cross-micro-batch hazard — the expert home section
+    holds a single set of B borrow slots per generation, so micro-batch i+1's
+    prefetch would overwrite the experts micro-batch i's GEMM still reads — and
+    it is deferred to ``prepare_experts`` for that call instead of running
+    inside ``dispatch``. See ``_async_parallel_enabled`` in the MoonEP
+    dispatcher. Default off.
+    """
+    return os.environ.get("MOONEP_ASYNC_PARALLEL", "0") == "1"
+
+
 class MoEDecoderLayerOutput(TypedDict):
     """Per-micro-batch outputs of one :class:`MoEDecoderLayer` forward."""
 
@@ -726,12 +753,23 @@ class MoEDecoderLayer(nn.Module):
         shared_experts_out_list: list[torch.Tensor | None] = []
 
         # dispatch + experts + pre-combine
-        for i, (router_results, pre_dispatched) in enumerate(zip(router_results_list, pre_dispatched_list)):
-            dispatched = self.dispatcher.dispatch(
-                pre_dispatched=pre_dispatched,
-                topk_weights=router_results["topk_weights"],
-                async_op=True,
-            )
+        #
+        # ``MOONEP_ASYNC_PARALLEL=1`` pipelines micro-batch i's routed dispatch
+        # against micro-batch i-1's experts GEMM, so the AIV dispatch runs on
+        # the comm stream while the Cube GEMM runs on the compute stream. The
+        # dispatch contract is already "launch now, join in
+        # dispatch_postprocess", so the reordering adds no waiting. Default off
+        # — see ``_intra_layer_interleave_enabled``.
+        interleave = _intra_layer_interleave_enabled()
+
+        def _issue_routed_compute(i: int) -> None:
+            """Issue micro-batch ``i``'s postprocess + experts GEMM + pre-combine.
+
+            Must be called in increasing ``i``: the three output lists are
+            appended in call order and consumed positionally downstream.
+            """
+            pre_dispatched = pre_dispatched_list[i]
+            dispatched = dispatched_list[i]
             # Overlap: issue the shared-experts GEMM on the compute stream
             # while the dispatch all-to-all runs on the comm stream, then
             # wait for the a2a. Shared input is the attention output
@@ -766,8 +804,38 @@ class MoEDecoderLayer(nn.Module):
 
             post_dispatched_list.append(post_dispatched)
             experts_out_list.append(experts_out)
-            dispatched_list.append(dispatched)
             pre_combined_list.append(pre_combined)
+
+        if interleave:
+            # Software pipeline: submit dispatch i, then immediately issue the
+            # compute of micro-batch i-1. That compute needs no host-side data
+            # from dispatch i, so it lands on the compute stream while dispatch
+            # i still runs on the comm stream.
+            issued = 0
+            for i, router_results in enumerate(router_results_list):
+                dispatched_list.append(
+                    self.dispatcher.dispatch(
+                        pre_dispatched=pre_dispatched_list[i],
+                        topk_weights=router_results["topk_weights"],
+                        async_op=True,
+                    )
+                )
+                if issued < i:
+                    _issue_routed_compute(issued)
+                    issued += 1
+            while issued < len(dispatched_list):
+                _issue_routed_compute(issued)
+                issued += 1
+        else:
+            for i, pre_dispatched in enumerate(pre_dispatched_list):
+                dispatched_list.append(
+                    self.dispatcher.dispatch(
+                        pre_dispatched=pre_dispatched,
+                        topk_weights=router_results_list[i]["topk_weights"],
+                        async_op=True,
+                    )
+                )
+                _issue_routed_compute(i)
 
         for pre_combined, pre_dispatched, dispatched, post_dispatched in zip(
             pre_combined_list,

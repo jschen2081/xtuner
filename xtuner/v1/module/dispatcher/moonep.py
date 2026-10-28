@@ -12,7 +12,7 @@ private VMM workspace remains the deep module for physical expert layout.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, cast
 import os
 
@@ -197,6 +197,11 @@ class _MoonEPResources:
         with torch.cuda.stream(self.comm_stream):
             result = operation()
             done = self.comm_stream.record_event()
+        if self.comm_stream is not caller_stream:
+            # 输出张量在 comm_stream 上分配, 之后由 caller 流消费。不登记
+            #   caller 流的话, allocator 在 comm_stream 完成时就认为可复用,
+            #   caller 仍在使用 → UAF。(单独 comm 流已移除, 此分支留作防御)
+            _record_tensor_streams(result, caller_stream)
         return result, done
 
     def home_generation(self, layer: _MoonEPLayer) -> int:
@@ -411,9 +416,16 @@ class MoonEPModelRuntime:
             buffer=None,  # ★ Ascend: workspace built lazily in buffer_for
         )
 
-        # Keep MoonEP collectives in FSDP's device-side launch order. A
-        # separate high-priority stream forms an orthogonal progress wave with
-        # NCCL and stalls at MoonEP's rank barriers under a full model.
+        # ★ 2026-10-28 独立 comm 流已移除。Keep MoonEP collectives in FSDP's
+        #   device-side launch order: a separate high-priority stream forms an
+        #   orthogonal progress wave with HCCL and stalls at MoonEP's rank
+        #   barriers, and on Ascend it also deadlocks outright —
+        #   ``_combine_xt`` reads ``plan.resolve_nsegs()`` back to the host, and
+        #   that D2H waits on the dedicated stream while the compute stream is
+        #   still waiting for the same combine (measured: ACL stream synchronize
+        #   failed 507015, then SIGABRT on every rank). ``enqueue`` therefore
+        #   degrades to a no-op stream switch, which is what all the overlap
+        #   work below is built on top of.
         comm_stream = torch.cuda.current_stream()
 
         try:
@@ -544,13 +556,50 @@ class MoonEPPostCombineResult(TypedDict):
     hidden_states: torch.Tensor  # [S, H].
 
 
-def _prefetch_parallel_enabled() -> bool:
-    """Whether weight prefetch runs concurrently with dispatch on its own stream.
+def _async_parallel_enabled() -> bool:
+    """Whether MoonEP communication is submitted asynchronously and overlapped.
+
+    ``MOONEP_ASYNC_PARALLEL=1`` is the single switch for the communication /
+    compute overlap that in-layer micro-batching depends on. It turns on three
+    cooperating effects, none of which pays off alone (measured on Qwen3-30B
+    EP8 ILMB=2: either half alone leaves the step at ~14.3 s, both together
+    reach 13.1 s):
+
+    * the routed dispatch is launched without the host-side
+      ``aclrtSynchronizeStream``. That sync costs ~11 ms of host time per
+      micro-batch (the kernel spins on the remote MAGIC flag for most of it),
+      and while the host sits inside it the next micro-batch's prepare/GEMM
+      cannot be submitted;
+    * the weight prefetch runs on its own stream instead of the compute stream,
+      so the transfer proceeds while dispatch and GEMM are being launched;
+    * the prefetch waits for this call's own GEMM (see
+      :func:`run_deferred_prefetch`). The expert home section holds one set of B
+      borrow slots per generation shared by every in-layer micro-batch, so a
+      later micro-batch's prefetch would otherwise overwrite the experts an
+      earlier micro-batch's GEMM is still reading — a deterministic
+      wrong-weight read (measured: borrow slot 2 holds expert 105 for
+      micro-batch 0, expert 98 for micro-batch 1), not a tolerance-level
+      difference.
 
     Read per call rather than cached so a single-process A/B does not need a
     restart; the environment is consulted once per routed layer.
     """
-    return os.environ.get("MOONEP_PREFETCH_PARALLEL", "0") == "1"
+    return os.environ.get("MOONEP_ASYNC_PARALLEL", "0") == "1"
+
+
+def _record_tensor_streams(result: Any, stream: Any) -> None:
+    """Walk an enqueue result and pin every tensor to the consumer stream.
+
+    The transaction result is a tensor, a tuple of tensors, or a tuple holding
+    a ``(tensors..., event)`` pair. Registering the consumer stream keeps the
+    caching allocator from recycling a comm-stream allocation while the caller
+    stream still reads it.
+    """
+    if isinstance(result, torch.Tensor):
+        result.record_stream(stream)
+    elif isinstance(result, (tuple, list)):
+        for item in result:
+            _record_tensor_streams(item, stream)
 
 
 @dataclass
@@ -562,6 +611,13 @@ class _MoonEPLayerGradients:
     """
 
     initialized: bool = False
+    # ★★ B6 (2026-10-27) ILMB: "first producer" 必须按 **梯度槽** 判, 不能按层判。
+    #   intra_layer_micro_batch > 1 时每个微批占一个独立槽 (B4), 每层只写同一槽
+    #   一次 → 该槽在层的首次使用就是它的 first producer。按层判会让第 2 个微批
+    #   的槽既不被覆写也不被预清零, GEMM 的 add_ 累积到上一步/上一层的残留上
+    #   (实测专家梯度 ≈ 48 层累加、norm ×51)。G=1 时与旧的按层判等价。
+    gmm_written: set[int] = field(default_factory=set)
+    reduced: set[int] = field(default_factory=set)
 
 
 @dataclass(eq=False)
@@ -586,11 +642,22 @@ class _MoonEPLayerCallState:
     # event is recorded once its named producer has been enqueued.
     plan: Any | None = None
     dispatch_done: Any | None = None
+    dispatch_event: Any | None = None
     weights_ready: Any | None = None
     combine_done: Any | None = None
 
     # Borrowed local [2B, O_p, I_p] weight aliases for this call.
     local_weights: ProjectionPair | None = None
+
+    # Deferred weight prefetch (``MOONEP_ASYNC_PARALLEL``): the home borrow
+    # slots hold one set of B rows per generation, and each micro-batch's
+    # prefetch fills them with the experts its own routing chose. Running the
+    # prefetch inside ``dispatch`` therefore lets micro-batch i+1 rewrite the
+    # slots micro-batch i's GEMM is still reading. With the prefetch deferred
+    # it is issued right before this call's own GEMM instead, so it is ordered
+    # behind the previous micro-batch's GEMM.
+    prefetch_buffer: Any | None = None
+    prefetch_deferred: bool = False
 
     # Current FSDP unsharded home Parameters [B, O_p, I_p] receive the returned
     # BF16 home gradients after both local projections complete.
@@ -623,14 +690,59 @@ def finish_combine(state: _MoonEPLayerCallState, combined: torch.Tensor, *, asyn
     return combined
 
 
+def run_deferred_prefetch(state: _MoonEPLayerCallState) -> None:
+    """Fill this call's home borrow slots, right before its own GEMM consumes them.
+
+    ``prepare_experts`` is the first weight consumer of a call, so issuing the
+    transfer here orders it behind the previous micro-batch's GEMM. That
+    ordering is what makes in-layer interleave correct: the borrow slots are
+    shared by every micro-batch of the layer, so a prefetch that ran inside
+    ``dispatch`` would let micro-batch i+1 overwrite the experts micro-batch i
+    is still reading.
+
+    The transfer goes to the dedicated prefetch stream rather than the compute
+    stream. ``start_prefetch`` folds the launching stream's current point into
+    its completion event, which is exactly the "previous GEMM has retired" edge
+    this ordering needs, so the transfer runs alongside the following launches
+    instead of blocking the host.
+    """
+    if not state.prefetch_deferred:
+        return
+    buffer = state.prefetch_buffer
+    plan = state.plan
+    state.prefetch_deferred = False
+    state.prefetch_buffer = None
+    assert buffer is not None and plan is not None
+    workspace = state.resources.workspace
+    generation = state.generation
+    with torch.profiler.record_function("MoonEP::deferred_prefetch"):
+        done = workspace.start_prefetch(
+            buffer=buffer,
+            plan=plan,
+            generation=generation,
+            stream=buffer.prefetch_stream,
+        )
+        state.local_weights = workspace.local_weights(generation=generation)
+        # This call's GEMM is the transfer's only consumer.
+        torch.cuda.current_stream().wait_event(done)
+
+
 def prepare_experts(state: _MoonEPLayerCallState, dispatched: MoonEPDispatchResult) -> MoonEPPostDispatchResult:
     """Wait at the first weight consumer and expose the tensor-only layout."""
     resources = state.resources
     assert state.weights_ready is not None
 
+    run_deferred_prefetch(state)
+
     with torch.profiler.record_function("MoonEP::prepare_experts"):
         # This inserts a device dependency; it never waits on the host.
         state.weights_ready.wait()
+        # ``dispatch`` completes on its own comm stream; join it here, at the
+        # first consumer of the routed tokens, rather than back in
+        # ``dispatch_forward`` where the wait would also gate the following
+        # micro-batch's dispatch and destroy the overlap.
+        if state.dispatch_event is not None:
+            state.dispatch_event.wait()
         # Both halves of the ``[E+B] -> [2B]`` contract now live in the
         # workspace: the caller cannot receive counts it must still fix up.
         hidden_states, local_counts = resources.workspace.local_compute_view(
@@ -661,11 +773,12 @@ def prepare_experts(state: _MoonEPLayerCallState, dispatched: MoonEPDispatchResu
         #   (空组行写 0 — ops/tests 探针验证 garbage-heap == zero-heap), 因此
         #   home 无需预清零: producer 1 覆写其余 add_ 累加即为正确和。仅
         #   MOONEP_X8_DW=0 (全物化回退, home 走 add_) 仍需预清零。
-        first_producer = not state.layer_gradients.initialized
+        first_producer = grad_slot not in state.layer_gradients.gmm_written
         if first_producer:
             if os.environ.get("MOONEP_X8_DW", "1") == "0":
                 for proj in (0, 1):
                     workspace.home_grad_view(grad_slot, proj).zero_()
+            state.layer_gradients.gmm_written.add(grad_slot)
             state.layer_gradients.initialized = True
         grad_weight_out = (
             workspace.grad_view(grad_slot, 0),
@@ -719,25 +832,56 @@ def dispatch_forward(
                 stream=buffer.prefetch_stream,
             )
 
-        prefetch_parallel = _prefetch_parallel_enabled()
-        hidden_nvsh, route_weights_nvs, cu_seqlens, plan = buffer.dispatch(
+        async_parallel = _async_parallel_enabled()
+        # In-layer micro-batching needs the prefetch to follow this call's own
+        # GEMM; a single micro-batch has no neighbour to clash with.
+        defer_prefetch = async_parallel and resources.gradient_slots > 1
+        dispatched = buffer.dispatch(
             source_hidden,
             route_weights_sk=source_route_weights,
             topk_experts_sk=topk_ids,
             tokens_per_expert=tokens_per_expert,
-            async_finish=False,
+            async_finish=async_parallel,
             zero_copy=False,
             # ``None`` keeps the serial path: dispatch, then prefetch.
-            prefetch_hook=start_prefetch if prefetch_parallel else None,
+            prefetch_hook=start_prefetch if (async_parallel and not defer_prefetch) else None,
+            # ★★ B6 (2026-10-27) ILMB: 层内多微批各占一个梯度槽, 同槽号隔离
+            #   对称堆的 hidden/weights/status 份 (Ascend 专用, 其他实现忽略)。
+            mb_idx=state.grad_slot,
         )
+        if async_parallel:
+            hidden_nvsh, route_weights_nvs, cu_seqlens, plan, dispatch_event = dispatched
+        else:
+            hidden_nvsh, route_weights_nvs, cu_seqlens, plan = dispatched
+            dispatch_event = None
         assert route_weights_nvs is not None and cu_seqlens is not None
         state.plan = plan
-        state.dispatch_done = torch.cuda.current_stream().record_event()
+        if dispatch_event is not None:
+            # ``dispatch`` ran on the buffer's own comm stream. Do **not** fold
+            # its completion into this stream here: a ``wait_event`` gates every
+            # later launch on the current stream, so the compute of micro-batch
+            # i would queue behind micro-batch i+1's dispatch as well and the
+            # two could never overlap. ``prepare_experts`` joins this event at
+            # the first consumer instead, which is the only place that needs
+            # the dispatched tokens to have landed.
+            state.dispatch_event = dispatch_event
+            state.dispatch_done = dispatch_event
+        else:
+            state.dispatch_event = None
+            state.dispatch_done = torch.cuda.current_stream().record_event()
         # Only local weights are returned now; the gradient slot views are
         # created inside ``return_expert_gradients`` when they are needed.
-        if prefetch_parallel:
-            # The transfer already ran concurrently; dispatch joined it before
-            # returning, so the aliases are safe to hand out directly.
+        if defer_prefetch:
+            # Leave the home borrow slots untouched until this call's GEMM is
+            # about to run: a later micro-batch's dispatch would otherwise
+            # refill them ahead of the earlier micro-batch's read.
+            state.prefetch_buffer = buffer
+            state.prefetch_deferred = True
+            state.local_weights = None
+        elif async_parallel:
+            # The transfer already ran concurrently on the prefetch stream;
+            # dispatch joined it before returning, so the aliases are safe to
+            # hand out directly.
             state.local_weights = resources.workspace.local_weights(generation=state.generation)
         else:
             state.local_weights = resources.workspace.prefetch_weights(
@@ -776,6 +920,7 @@ def dispatch_backward(
             route_weights_nvs=grad_route_weights_nvs,
             async_finish=False,
             zero_copy=False,
+            mb_idx=state.grad_slot,
         )
         assert grad_route_weights is not None and no_event is None
         return grad_hidden, grad_route_weights
@@ -808,6 +953,7 @@ def combine_forward(
             route_weights_nvs=None,
             async_finish=False,
             zero_copy=False,
+            mb_idx=state.grad_slot,
         )
         assert gathered_weights is None and no_event is None
         return output
@@ -849,20 +995,21 @@ def combine_backward(state: _MoonEPLayerCallState, grad_output: torch.Tensor) ->
                 stream=buffer.prefetch_stream,
             )
 
-        prefetch_parallel = _prefetch_parallel_enabled()
+        async_parallel = _async_parallel_enabled()
         grad_weighted, no_weights, no_cu, reused_plan = buffer.dispatch(
             grad_output,
             plan=state.plan,
             async_finish=False,
             zero_copy=False,
-            prefetch_hook=start_prefetch if prefetch_parallel else None,
+            prefetch_hook=start_prefetch if async_parallel else None,
+            mb_idx=state.grad_slot,
         )
         # ★ Ascend buffer.dispatch 无条件返回 cu_seqlens (plan 的视图, 非 None),
         #   权重在 plan 复用模式下也不产出 — 断言只锁 plan 身份 (数据面正确性:
         #   grad_weighted 按 state.plan 的 dst 打包, 复用同一 plan 即正确)。
         assert no_weights is None and reused_plan is state.plan
         gradient_dispatch_done = torch.cuda.current_stream().record_event()
-        if not prefetch_parallel:
+        if not async_parallel:
             resources.workspace.prefetch_weights(buffer=buffer, plan=state.plan, generation=state.generation)
         return grad_weighted, gradient_dispatch_done
 
@@ -915,11 +1062,12 @@ def start_gradient_completion(state: _MoonEPLayerCallState, gradients: Projectio
                 plan=state.plan,
                 gradients=gradients,
                 grad_slot=state.grad_slot,
-                initialize=not state.layer_gradients.initialized,
+                initialize=state.grad_slot not in state.layer_gradients.reduced,
                 x8=x8,
             ),
             inputs=inputs,
         )
+    state.layer_gradients.reduced.add(state.grad_slot)
     state.layer_gradients.initialized = True
     state.gradient_completion = (home_grads, done)
 
@@ -991,17 +1139,16 @@ class _MoonEPLayerGradJoin(torch.autograd.Function):
     @staticmethod
     def backward(ctx: Any, *grad_inputs: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
         # Event.wait inserts a dependency into the current CUDA stream; it does
-        # not block the Python host or poll event readiness. Every call state's
-        # returned views alias the same home H, so completing all of them and
-        # publishing the last pair once is correct; publishing each would count
-        # the whole sum repeatedly. Native FSDP consumes it once via copy-in
-        # before upstream calls may reuse H; RS itself may remain asynchronous.
-        home_parameters: tuple[nn.Parameter, nn.Parameter] | None = None
-        home_grads: ProjectionPair | None = None
+        # not block the Python host or poll event readiness.
+        # ★★ B6 (2026-10-27) ILMB: each microbatch owns its own gradient slot, and
+        # the home prefix is slot-local (``get_xt_grad_view`` offsets by
+        # ``slot_idx * per_slot``), so the call states no longer alias one shared
+        # home. Publish every pair and let ``accumulate_fsdp_unsharded_expert_gradients``
+        # sum them with ``add_``; publishing only the last would drop all but one
+        # microbatch. With G=1 the loop runs once and behaviour is unchanged.
         for call_state in ctx.call_states:
-            home_parameters, home_grads = finish_gradient_completion(call_state)
-        assert home_parameters is not None and home_grads is not None
-        accumulate_fsdp_unsharded_expert_gradients(home_parameters, home_grads)
+            call_parameters, call_grads = finish_gradient_completion(call_state)
+            accumulate_fsdp_unsharded_expert_gradients(call_parameters, call_grads)
         return (None, *grad_inputs)
 
 
