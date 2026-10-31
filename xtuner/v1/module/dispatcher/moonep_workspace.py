@@ -81,12 +81,13 @@ def _masked_copy_mode() -> str:
     - ``copy``: MoonEP ``masked_copy`` into a fresh buffer, at a bounded block count.
     - ``mul``: ``src * row_is_covered``, an ``aclnnMul`` tiled at every AIV.
 
-    The three agree bit-for-bit; they differ in what they cost the main stream,
-    which is what decides whether the neighbouring micro-batch's ``combine``
-    can retire alongside this micro-batch's experts GEMM.  On Qwen3-235B slim
-    (ILMB=2, single node) ``inplace`` measured 5.446 s/step against 5.546 s for
-    ``mul``, and the only reason it can win is that a balanced dispatch has no
-    padding rows to write at all.
+    The three agree in value (``-0.0`` vs ``+0.0`` is the only bit difference,
+    plus a non-finite padding row becoming 0); they differ in what they cost
+    the main stream, which is what decides whether the neighbouring
+    micro-batch's ``combine`` can retire alongside this micro-batch's experts
+    GEMM.  On Qwen3-235B slim (ILMB=2, single node) ``inplace`` measured
+    5.446 s/step against 5.546 s for ``mul``, and the only reason it can win is
+    that a balanced dispatch has no padding rows to write at all.
     """
     if moonep_ops is None or not hasattr(moonep_ops, "masked_copy"):
         return "mul"
@@ -102,9 +103,11 @@ def _masked_copy_mode() -> str:
 class _MaskedCopy(torch.autograd.Function):
     """``dst = src`` over the covered prefix and zeros past it.
 
-    Bit-identical to ``src * row_is_covered`` (the mask is 0/1, so the bf16
-    product is exact) except that a non-finite padding row becomes 0 rather
-    than staying non-finite.  Forward and backward both use the MoonEP kernel,
+    Same values as ``src * row_is_covered`` (the mask is 0/1, so the bf16
+    product is exact), except that the zeroed tail is ``+0.0`` where the
+    multiply keeps the sign bit (``-0.0``), and a non-finite padding row
+    becomes 0 rather than staying non-finite.  Neither difference is visible
+    to the GEMM.  Forward and backward both use the MoonEP kernel,
     which keeps both directions inside the configurable block budget.
     """
 
