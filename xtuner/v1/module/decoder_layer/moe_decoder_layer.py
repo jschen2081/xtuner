@@ -58,7 +58,7 @@ HiddenStates: TypeAlias = torch.Tensor
 def _intra_layer_interleave_enabled() -> bool:
     """Whether in-layer micro-batches pipeline dispatch against experts GEMM.
 
-    ``MOONEP_ASYNC_PARALLEL=1`` submits micro-batch ``i``'s routed dispatch and
+    ``MOONEP_DISPATCH_OVERLAP=1`` submits micro-batch ``i``'s routed dispatch and
     then immediately issues micro-batch ``i-1``'s postprocess + experts GEMM, so
     the AIV dispatch runs while the Cube GEMM of the previous micro-batch runs
     on the compute stream.
@@ -79,7 +79,20 @@ def _intra_layer_interleave_enabled() -> bool:
     inside ``dispatch``. See ``_async_parallel_enabled`` in the MoonEP
     dispatcher. Default off.
     """
-    return os.environ.get("MOONEP_ASYNC_PARALLEL", "0") == "1"
+    return os.environ.get("MOONEP_DISPATCH_OVERLAP", "0") == "1"
+
+
+def _combine_overlap_enabled() -> bool:
+    """Whether each in-layer micro-batch's combine is issued right after its GEMM.
+
+    ``MOONEP_COMBINE_OVERLAP=1`` submits micro-batch ``i``'s combine as soon as
+    its experts GEMM is queued, instead of collecting every micro-batch's
+    combine at the layer tail. The combine is launched on MoonEP's own stream
+    and returns to the host immediately, so micro-batch ``i+1``'s GEMM is
+    submitted beside it rather than after it. Output order is unchanged.
+    Default off.
+    """
+    return os.environ.get("MOONEP_COMBINE_OVERLAP", "0") == "1"
 
 
 class MoEDecoderLayerOutput(TypedDict):
@@ -754,7 +767,7 @@ class MoEDecoderLayer(nn.Module):
 
         # dispatch + experts + pre-combine
         #
-        # ``MOONEP_ASYNC_PARALLEL=1`` pipelines micro-batch i's routed dispatch
+        # ``MOONEP_DISPATCH_OVERLAP=1`` pipelines micro-batch i's routed dispatch
         # against micro-batch i-1's experts GEMM, so the AIV dispatch runs on
         # the comm stream while the Cube GEMM runs on the compute stream. The
         # dispatch contract is already "launch now, join in
@@ -806,6 +819,22 @@ class MoEDecoderLayer(nn.Module):
             experts_out_list.append(experts_out)
             pre_combined_list.append(pre_combined)
 
+        def _issue_combine(i: int) -> torch.Tensor:
+            """Issue micro-batch ``i``'s routed combine and return its output.
+
+            Reads the lists by index, so it must follow ``_issue_routed_compute(i)``.
+            """
+            return self.dispatcher.combine(
+                pre_combined=pre_combined_list[i],
+                pre_dispatched=pre_dispatched_list[i],
+                dispatched=dispatched_list[i],
+                post_dispatched=post_dispatched_list[i],
+                async_op=True,
+            )
+
+        combine_overlap = _combine_overlap_enabled()
+        combined_by_index: dict[int, torch.Tensor] = {}
+
         if interleave:
             # Software pipeline: submit dispatch i, then immediately issue the
             # compute of micro-batch i-1. That compute needs no host-side data
@@ -822,9 +851,13 @@ class MoEDecoderLayer(nn.Module):
                 )
                 if issued < i:
                     _issue_routed_compute(issued)
+                    if combine_overlap:
+                        combined_by_index[issued] = _issue_combine(issued)
                     issued += 1
             while issued < len(dispatched_list):
                 _issue_routed_compute(issued)
+                if combine_overlap:
+                    combined_by_index[issued] = _issue_combine(issued)
                 issued += 1
         else:
             for i, pre_dispatched in enumerate(pre_dispatched_list):
@@ -836,21 +869,27 @@ class MoEDecoderLayer(nn.Module):
                     )
                 )
                 _issue_routed_compute(i)
+                if combine_overlap:
+                    combined_by_index[i] = _issue_combine(i)
 
-        for pre_combined, pre_dispatched, dispatched, post_dispatched in zip(
-            pre_combined_list,
-            pre_dispatched_list,
-            dispatched_list,
-            post_dispatched_list,
-        ):
-            combined = self.dispatcher.combine(
-                pre_combined=pre_combined,
-                pre_dispatched=pre_dispatched,
-                dispatched=dispatched,
-                post_dispatched=post_dispatched,
-                async_op=True,
-            )
-            combined_list.append(combined)
+        for i in range(len(pre_combined_list)):
+            if i not in combined_by_index:
+                combined_by_index[i] = self.dispatcher.combine(
+                    pre_combined=pre_combined_list[i],
+                    pre_dispatched=pre_dispatched_list[i],
+                    dispatched=dispatched_list[i],
+                    post_dispatched=post_dispatched_list[i],
+                    async_op=True,
+                )
+            combined_list.append(combined_by_index.pop(i))
+
+        # One cross-rank barrier per layer. ``mb_idx`` already keeps one
+        # micro-batch's slot reset out of another's way, so only the handover to
+        # the next layer's dispatch needs one — and doing it per micro-batch
+        # would cut across the combine/GEMM overlap MOONEP_COMBINE_OVERLAP builds.
+        layer_barrier = getattr(self.dispatcher, "layer_barrier", None)
+        if layer_barrier is not None:
+            layer_barrier()
 
         if self.n_shared_experts > 0 and not self.shared_overlap:
             # Serial path: shared-experts GEMM after combine (no overlap).

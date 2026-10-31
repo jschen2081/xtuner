@@ -42,16 +42,61 @@ def _masked_copy_aiv() -> int:
     return max(1, value)
 
 
-def _masked_copy_enabled() -> bool:
-    """Whether the masked copy runs on the MoonEP kernel instead of ``mul``.
+_mul_overlap_warning_emitted = False
 
-    Off by default: the kernel buys overlap only when micro-batches interleave
-    (``MOONEP_ASYNC_PARALLEL=1``), and on its own the reduced parallelism makes
-    the copy slower than the full-core multiply.
+
+def _warn_mul_disables_combine_overlap() -> None:
+    """Warn once when ``mul`` is paired with the combine/compute overlap.
+
+    ``mul`` runs as an ``aclnnMul`` tiled at every AIV, and a full-core kernel
+    cannot start while a MoonEP collective still holds a core. It therefore
+    waits for the whole dispatch to retire, which pushes the neighbouring
+    micro-batch's experts GEMM behind it — leaving the combine nothing to
+    overlap with. The values are identical to the other two modes; only the
+    overlap is lost, so this is a warning rather than an error.
+    """
+    global _mul_overlap_warning_emitted
+    if _mul_overlap_warning_emitted:
+        return
+    if os.environ.get("MOONEP_COMBINE_OVERLAP", "0") != "1":
+        return
+    _mul_overlap_warning_emitted = True
+    warnings.warn(
+        "MOONEP_MASKED_COPY=mul with MOONEP_COMBINE_OVERLAP=1: the compute view "
+        "runs as a full-core aclnnMul that cannot start while a MoonEP "
+        "collective holds cores, so the combine has no experts GEMM to overlap "
+        "with. Use MOONEP_MASKED_COPY=inplace (default) or 'copy'.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
+
+def _masked_copy_mode() -> str:
+    """Which implementation produces the zeroed compute view.
+
+    ``MOONEP_MASKED_COPY`` selects between three equivalent results:
+
+    - ``inplace`` (default): zero only the rows past ``covered`` in place and hand
+      ``src`` straight to the GEMM, skipping the copy of the covered prefix.
+    - ``copy``: MoonEP ``masked_copy`` into a fresh buffer, at a bounded block count.
+    - ``mul``: ``src * row_is_covered``, an ``aclnnMul`` tiled at every AIV.
+
+    The three agree bit-for-bit; they differ in what they cost the main stream,
+    which is what decides whether the neighbouring micro-batch's ``combine``
+    can retire alongside this micro-batch's experts GEMM.  On Qwen3-235B slim
+    (ILMB=2, single node) ``inplace`` measured 5.446 s/step against 5.546 s for
+    ``mul``, and the only reason it can win is that a balanced dispatch has no
+    padding rows to write at all.
     """
     if moonep_ops is None or not hasattr(moonep_ops, "masked_copy"):
-        return False
-    return os.environ.get("MOONEP_MASKED_COPY", "0") == "1"
+        return "mul"
+    mode = os.environ.get("MOONEP_MASKED_COPY", "inplace").strip().lower()
+    if mode in ("0", "mul", "false"):
+        _warn_mul_disables_combine_overlap()
+        return "mul"
+    if mode in ("1", "copy", "true"):
+        return "copy"
+    return "inplace"
 
 
 class _MaskedCopy(torch.autograd.Function):
@@ -78,6 +123,38 @@ class _MaskedCopy(torch.autograd.Function):
         out = torch.empty_like(source)
         moonep_ops.masked_copy(out, source, covered, ctx.nblk)
         return out, None, None
+
+
+class _MaskedZeroTail(torch.autograd.Function):
+    """``src`` with the rows past ``covered`` zeroed in place.
+
+    Same values as :class:`_MaskedCopy`, minus the copy: the covered prefix is
+    already what the multiply would produce, so only the padding tail has to be
+    written, and when the dispatch is balanced (``covered == rows``, the normal
+    case for an evenly split all-to-all) the kernel writes nothing at all.
+
+    Writing into ``src`` is safe here because ``prepare_experts`` runs strictly
+    after ``dispatch_event.wait()``: no remote PUT can still be landing in this
+    buffer, so the zeroing cannot clobber an in-flight token.  Backward zeroes
+    the same tail in place for the same reason.
+    """
+
+    @staticmethod
+    def forward(ctx: Any, src: torch.Tensor, covered: torch.Tensor, nblk: int) -> torch.Tensor:
+        moonep_ops.masked_copy(src, src, covered, nblk)
+        ctx.save_for_backward(covered)
+        ctx.nblk = nblk
+        ctx.mark_dirty(src)
+        return src
+
+    @staticmethod
+    def backward(ctx: Any, grad: torch.Tensor) -> tuple[torch.Tensor | None, None, None]:
+        # Same tail as forward: ``dispatch_backward`` feeds this straight into
+        # ``combine``, so the padding rows must not carry a GEMM gradient.
+        (covered,) = ctx.saved_tensors
+        source = grad if grad.is_contiguous() else grad.contiguous()
+        moonep_ops.masked_copy(source, source, covered, ctx.nblk)
+        return source, None, None
 
 
 # Shape legend used by every workspace structure below:
@@ -500,7 +577,14 @@ class _ExpertVMMWorkspace:
         counts = self._local_token_counts(cu_seqlens)
         covered = counts.sum()
         n_rows = hidden_nvsh.shape[0]
-        if _masked_copy_enabled():
+        mode = _masked_copy_mode()
+        if mode == "inplace":
+            # ``MOONEP_MASKED_COPY=inplace``: only the padding tail is written,
+            # so a balanced dispatch retires this step with no memory traffic at
+            # all and the experts GEMM can start while the neighbouring
+            # micro-batch's combine is still running.
+            hidden = _MaskedZeroTail.apply(hidden_nvsh, covered.to(torch.int32), _masked_copy_aiv())
+        elif mode == "copy":
             # ``MOONEP_MASKED_COPY=1``: same values as the multiply below, but
             # on a bounded block count so it can overlap a neighbouring
             # micro-batch's dispatch instead of queueing behind it.

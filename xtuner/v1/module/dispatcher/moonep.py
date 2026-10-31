@@ -186,21 +186,33 @@ class _MoonEPResources:
         operation: Callable[[], Any],
         *,
         inputs: tuple[torch.Tensor | None, ...] = (),
+        wait_event: torch.cuda.Event | None = None,
+        dedicated: bool = False,
     ) -> tuple[Any, torch.cuda.Event]:
         """Run one MoonEP transaction on XTuner's stream and return ``(result,
-        done event)``."""
+        done event)``.
+
+        ``wait_event`` pins the transaction's dependency to a caller-stream
+        position recorded earlier. It defaults to the current position, which
+        orders this transaction behind everything already submitted; passing an
+        earlier event lets a later compute launch proceed beside it.
+
+        ``dedicated`` routes the transaction to ``comm_stream`` instead of the
+        caller's stream. It is a no-op unless ``MOONEP_COMBINE_OVERLAP=1``
+        allocated a real second stream.
+        """
         caller_stream = torch.cuda.current_stream()
-        self.comm_stream.wait_event(caller_stream.record_event())
+        target = self.comm_stream if dedicated else caller_stream
+        target.wait_event(wait_event if wait_event is not None else caller_stream.record_event())
         for tensor in inputs:
             if tensor is not None:
-                tensor.record_stream(self.comm_stream)
-        with torch.cuda.stream(self.comm_stream):
+                tensor.record_stream(target)
+        with torch.cuda.stream(target):
             result = operation()
-            done = self.comm_stream.record_event()
-        if self.comm_stream is not caller_stream:
-            # 输出张量在 comm_stream 上分配, 之后由 caller 流消费。不登记
-            #   caller 流的话, allocator 在 comm_stream 完成时就认为可复用,
-            #   caller 仍在使用 → UAF。(单独 comm 流已移除, 此分支留作防御)
+            done = target.record_event()
+        if target is not caller_stream:
+            # 输出张量在目标流上分配, 之后由 caller 流消费。不登记 caller 流的
+            #   话, allocator 在目标流完成时就认为可复用, caller 仍在使用 → UAF。
             _record_tensor_streams(result, caller_stream)
         return result, done
 
@@ -426,7 +438,15 @@ class MoonEPModelRuntime:
         #   failed 507015, then SIGABRT on every rank). ``enqueue`` therefore
         #   degrades to a no-op stream switch, which is what all the overlap
         #   work below is built on top of.
-        comm_stream = torch.cuda.current_stream()
+        # ★ 2026-10-29 独立流随 MOONEP_COMBINE_OVERLAP 一起开。A separate stream
+        #   is a *necessary* condition for any compute/communication overlap:
+        #   with one stream every dispatch, GEMM and combine is serialised by
+        #   construction.
+        if _combine_overlap_enabled():
+            with torch.cuda.device(torch.cuda.current_device()):
+                comm_stream = torch.cuda.Stream()
+        else:
+            comm_stream = torch.cuda.current_stream()
 
         try:
             if hasattr(workspace, "_layout") and workspace._layout is None:
@@ -556,10 +576,10 @@ class MoonEPPostCombineResult(TypedDict):
     hidden_states: torch.Tensor  # [S, H].
 
 
-def _async_parallel_enabled() -> bool:
+def _dispatch_overlap_enabled() -> bool:
     """Whether MoonEP communication is submitted asynchronously and overlapped.
 
-    ``MOONEP_ASYNC_PARALLEL=1`` is the single switch for the communication /
+    ``MOONEP_DISPATCH_OVERLAP=1`` is the single switch for the communication /
     compute overlap that in-layer micro-batching depends on. It turns on three
     cooperating effects, none of which pays off alone (measured on Qwen3-30B
     EP8 ILMB=2: either half alone leaves the step at ~14.3 s, both together
@@ -584,7 +604,23 @@ def _async_parallel_enabled() -> bool:
     Read per call rather than cached so a single-process A/B does not need a
     restart; the environment is consulted once per routed layer.
     """
-    return os.environ.get("MOONEP_ASYNC_PARALLEL", "0") == "1"
+    return os.environ.get("MOONEP_DISPATCH_OVERLAP", "0") == "1"
+
+
+def _combine_overlap_enabled() -> bool:
+    """Whether the combine/compute overlap stack is switched on.
+
+    ``MOONEP_COMBINE_OVERLAP=1`` turns on the whole stack. Its legs are not
+    independently switchable: a combine only runs beside a GEMM when it is
+    issued on its own stream, launched without the host-side stream sync, and
+    the per-layer cross-rank barrier moves to Python — the four either pay off
+    together or not at all, and every partial combination was measured to be
+    useless or unsafe (see the notes at each use site).
+    """
+    return os.environ.get("MOONEP_COMBINE_OVERLAP", "0") == "1"
+
+
+_PY_BARRIER_WORK: list = [None]
 
 
 def _record_tensor_streams(result: Any, stream: Any) -> None:
@@ -645,11 +681,16 @@ class _MoonEPLayerCallState:
     dispatch_event: Any | None = None
     weights_ready: Any | None = None
     combine_done: Any | None = None
+    # Compute-stream position right after this call's experts GEMM. Recorded by
+    # ``combine_preprocess`` and used by ``combine_forward`` as the comm-stream
+    # dependency when the caller issues micro-batch i's combine before
+    # micro-batch i+1's GEMM (``MOONEP_COMBINE_OVERLAP``).
+    combine_dep_event: Any | None = None
 
     # Borrowed local [2B, O_p, I_p] weight aliases for this call.
     local_weights: ProjectionPair | None = None
 
-    # Deferred weight prefetch (``MOONEP_ASYNC_PARALLEL``): the home borrow
+    # Deferred weight prefetch (``MOONEP_DISPATCH_OVERLAP``): the home borrow
     # slots hold one set of B rows per generation, and each micro-batch's
     # prefetch fills them with the experts its own routing chose. Running the
     # prefetch inside ``dispatch`` therefore lets micro-batch i+1 rewrite the
@@ -832,24 +873,24 @@ def dispatch_forward(
                 stream=buffer.prefetch_stream,
             )
 
-        async_parallel = _async_parallel_enabled()
+        dispatch_overlap = _dispatch_overlap_enabled()
         # In-layer micro-batching needs the prefetch to follow this call's own
         # GEMM; a single micro-batch has no neighbour to clash with.
-        defer_prefetch = async_parallel and resources.gradient_slots > 1
+        defer_prefetch = dispatch_overlap and resources.gradient_slots > 1
         dispatched = buffer.dispatch(
             source_hidden,
             route_weights_sk=source_route_weights,
             topk_experts_sk=topk_ids,
             tokens_per_expert=tokens_per_expert,
-            async_finish=async_parallel,
+            async_finish=dispatch_overlap,
             zero_copy=False,
             # ``None`` keeps the serial path: dispatch, then prefetch.
-            prefetch_hook=start_prefetch if (async_parallel and not defer_prefetch) else None,
+            prefetch_hook=start_prefetch if (dispatch_overlap and not defer_prefetch) else None,
             # ★★ B6 (2026-10-27) ILMB: 层内多微批各占一个梯度槽, 同槽号隔离
             #   对称堆的 hidden/weights/status 份 (Ascend 专用, 其他实现忽略)。
             mb_idx=state.grad_slot,
         )
-        if async_parallel:
+        if dispatch_overlap:
             hidden_nvsh, route_weights_nvs, cu_seqlens, plan, dispatch_event = dispatched
         else:
             hidden_nvsh, route_weights_nvs, cu_seqlens, plan = dispatched
@@ -878,7 +919,7 @@ def dispatch_forward(
             state.prefetch_buffer = buffer
             state.prefetch_deferred = True
             state.local_weights = None
-        elif async_parallel:
+        elif dispatch_overlap:
             # The transfer already ran concurrently on the prefetch stream;
             # dispatch joined it before returning, so the aliases are safe to
             # hand out directly.
@@ -931,6 +972,11 @@ def dispatch_backward(
             inputs=(grad_hidden_nvsh, grad_route_weights_nvs),
         )
         done.wait()
+        # Backward has no overlap to protect: keep the barrier on this call so
+        # the next layer's dispatch cannot race this slot's reset.
+        if _combine_overlap_enabled():
+            with torch.cuda.stream(torch.cuda.default_stream()):
+                dist.barrier(group=resources.ep_group)
     return result
 
 
@@ -951,7 +997,7 @@ def combine_forward(
             hidden_nvsh=expert_output,
             hidden_scales_nvs=route_weights,
             route_weights_nvs=None,
-            async_finish=False,
+            async_finish=_combine_overlap_enabled(),
             zero_copy=False,
             mb_idx=state.grad_slot,
         )
@@ -959,10 +1005,17 @@ def combine_forward(
         return output
 
     with torch.profiler.record_function("MoonEP::combine_forward"):
+        _wait = state.combine_dep_event if _combine_overlap_enabled() else None
         output, state.combine_done = resources.enqueue(
             combine_output,
             inputs=(expert_output, route_weights),
+            # Combine overlap: the recorded position is this call's GEMM, not
+            # everything submitted since (which already includes the next
+            # micro-batch's GEMM).
+            wait_event=_wait,
+            dedicated=True,
         )
+    state.combine_dep_event = None
     if not async_op:
         state.combine_done.wait()
     return output
@@ -995,13 +1048,13 @@ def combine_backward(state: _MoonEPLayerCallState, grad_output: torch.Tensor) ->
                 stream=buffer.prefetch_stream,
             )
 
-        async_parallel = _async_parallel_enabled()
+        dispatch_overlap = _dispatch_overlap_enabled()
         grad_weighted, no_weights, no_cu, reused_plan = buffer.dispatch(
             grad_output,
             plan=state.plan,
             async_finish=False,
             zero_copy=False,
-            prefetch_hook=start_prefetch if async_parallel else None,
+            prefetch_hook=start_prefetch if dispatch_overlap else None,
             mb_idx=state.grad_slot,
         )
         # ★ Ascend buffer.dispatch 无条件返回 cu_seqlens (plan 的视图, 非 None),
@@ -1009,7 +1062,7 @@ def combine_backward(state: _MoonEPLayerCallState, grad_output: torch.Tensor) ->
         #   grad_weighted 按 state.plan 的 dst 打包, 复用同一 plan 即正确)。
         assert no_weights is None and reused_plan is state.plan
         gradient_dispatch_done = torch.cuda.current_stream().record_event()
-        if not async_parallel:
+        if not dispatch_overlap:
             resources.workspace.prefetch_weights(buffer=buffer, plan=state.plan, generation=state.generation)
         return grad_weighted, gradient_dispatch_done
 
@@ -1461,8 +1514,40 @@ class MoonEPDispatcher(
         async_op: bool = False,
         decoding: bool = False,
     ) -> MoonEPPreCombineResult:
-        del pre_dispatched, dispatched, post_dispatched, async_op, decoding
+        del dispatched, post_dispatched, async_op, decoding
+        if _combine_overlap_enabled():
+            # This runs right after the experts GEMM. Pin the combine's
+            # comm-stream dependency here so a later micro-batch's GEMM does not
+            # get folded into it.
+            _ev = torch.cuda.current_stream().record_event()
+            pre_dispatched["_moonep_call"].combine_dep_event = _ev
         return MoonEPPreCombineResult(hidden_states=hidden_states)
+
+    def layer_barrier(self) -> None:
+        """Separate this layer's combine slot reset from the next layer's dispatch.
+
+        The reset of a heap slot and the next layer's MAGIC write to the same
+        slot race across ranks, so one cross-rank barrier is needed per layer.
+        Call it once at the end of a layer, after every micro-batch's combine has
+        been issued: the per-micro-batch barriers the buffer used to insert
+        separate slots that ``mb_idx`` already keeps apart, and they cost the
+        overlap this layer's combine overlap relies on.
+
+        No-op unless ``MOONEP_COMBINE_OVERLAP=1``: on a single stream the buffer
+        keeps its own per-combine barrier, and moving it out would change nothing.
+        """
+        if not _combine_overlap_enabled():
+            return
+        resources = self._runtime.resources
+        _saved = torch.cuda.current_stream()
+        _main = torch.cuda.default_stream()
+        # Device-side: the barrier must observe every combine queued so far.
+        _main.wait_stream(resources.comm_stream)
+        with torch.cuda.stream(_main):
+            _PY_BARRIER_WORK[0] = dist.barrier(group=resources.ep_group, async_op=True)
+        _PY_BARRIER_WORK[0].wait()
+        if _saved.npu_stream != _main.npu_stream:
+            _saved.wait_stream(_main)
 
     @override
     def combine(
