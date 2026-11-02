@@ -120,6 +120,12 @@ class _MoonEPResources:
     # ★ 2026-09-23: Ascend DirectVMM 延迟 install 载体 (buffer_for 的 self 是
     #   resources, frozen dataclass 不能动态赋 → 声明字段, 构造时传入)。
     _deferred_landing_install: Any = None
+    # ★ 2026-11-02 MOONEP_BWD_COMBINE_OVERLAP: one in-flight combine event per
+    #   gradient slot. The backward combine keeps reading the slot on the comm
+    #   stream after the host has returned, so the ring must not hand the same
+    #   slot to a later call until that event has fired. The list is the only
+    #   mutable carrier inside this frozen record: it costs no device memory.
+    bwd_slot_events: list = field(default_factory=list, compare=False, hash=False)
 
     def buffer_for(self, tokens_per_rank: int) -> Any:
         """Dispatch entry: build the Fixed-S Buffer once, then check S."""
@@ -620,6 +626,22 @@ def _combine_overlap_enabled() -> bool:
     return os.environ.get("MOONEP_COMBINE_OVERLAP", "0") == "1"
 
 
+def _bwd_combine_overlap_enabled() -> bool:
+    """Whether the backward combine is issued on the comm stream.
+
+    ``MOONEP_BWD_COMBINE_OVERLAP=1`` covers the whole backward chain: the
+    gradient combine leaves the compute stream, its dependency is pinned to
+    this call's own expert GEMM instead of "everything submitted so far", the
+    per-slot in-flight events defer the wait to the layer's last micro-batch,
+    and a gradient slot is only handed out again once its previous combine has
+    been consumed.
+
+    Gated on ``MOONEP_COMBINE_OVERLAP``: without it there is no second stream to
+    issue on and the per-layer barrier still lives inside the buffer.
+    """
+    return os.environ.get("MOONEP_BWD_COMBINE_OVERLAP", "0") == "1" and _combine_overlap_enabled()
+
+
 _PY_BARRIER_WORK: list = [None]
 
 
@@ -654,6 +676,12 @@ class _MoonEPLayerGradients:
     #   (实测专家梯度 ≈ 48 层累加、norm ×51)。G=1 时与旧的按层判等价。
     gmm_written: set[int] = field(default_factory=set)
     reduced: set[int] = field(default_factory=set)
+    # ★ 2026-11-02 MOONEP_BWD_COMBINE_OVERLAP: this layer's micro-batch backward
+    #   combines still to be *issued*, and the events of the ones already issued.
+    #   The last micro-batch waits for all of them at once, which is also the
+    #   only place the layer barrier can observe every combine.
+    bwd_combine_pending: int = 0
+    bwd_combine_done: list = field(default_factory=list)
 
 
 @dataclass(eq=False)
@@ -686,6 +714,12 @@ class _MoonEPLayerCallState:
     # dependency when the caller issues micro-batch i's combine before
     # micro-batch i+1's GEMM (``MOONEP_COMBINE_OVERLAP``).
     combine_dep_event: Any | None = None
+    # ★ 2026-11-02 MOONEP_BWD_COMBINE_OVERLAP: the same pin for the backward
+    #   combine. Recorded by ``start_gradient_completion`` -- the first point at
+    #   which this call's dX is submitted -- so the comm-stream combine starts
+    #   behind this micro-batch's expert GEMM only, not behind the next
+    #   micro-batch's GEMM as well.
+    grad_ready_event: Any | None = None
 
     # Borrowed local [2B, O_p, I_p] weight aliases for this call.
     local_weights: ProjectionPair | None = None
@@ -953,13 +987,22 @@ def dispatch_backward(
     buffer = resources.buffer
     grad_hidden_nvsh = grad_hidden_nvsh.contiguous()
     grad_route_weights_nvs = grad_route_weights_nvs.contiguous()
+    bwd_overlap = _bwd_combine_overlap_enabled()
 
     def combine_gradients() -> tuple[torch.Tensor, torch.Tensor]:
         grad_hidden, grad_route_weights, no_event = buffer.combine(
             plan=state.plan,
             hidden_nvsh=grad_hidden_nvsh,
             route_weights_nvs=grad_route_weights_nvs,
-            async_finish=False,
+            # ★ 2026-11-02: hand the layer barrier over to the caller under
+            #   combine overlap, exactly like ``combine_forward`` does. With
+            #   ``async_finish=False`` the buffer keeps its own host-side
+            #   ``dist.barrier`` *and* the overlap branches below issue a second
+            #   one -- two identical cross-rank barriers per layer per
+            #   micro-batch. The leader--follower ``wait_status`` handshake still
+            #   guards hidden readiness; only the slot-reset barrier moves, and
+            #   it still sits between this combine and the next dispatch.
+            async_finish=_combine_overlap_enabled() or bwd_overlap,
             zero_copy=False,
             mb_idx=state.grad_slot,
         )
@@ -970,12 +1013,44 @@ def dispatch_backward(
         result, done = resources.enqueue(
             combine_gradients,
             inputs=(grad_hidden_nvsh, grad_route_weights_nvs),
+            # ★ MOONEP_BWD_COMBINE_OVERLAP: pin the combine to this call's own
+            #   expert GEMM. ``enqueue``'s default -- the caller stream's
+            #   position right now -- already contains the next micro-batch's
+            #   GEMM, which is precisely the work this combine should hide
+            #   behind.
+            wait_event=state.grad_ready_event if bwd_overlap else None,
+            dedicated=bwd_overlap,
         )
-        done.wait()
-        # Backward has no overlap to protect: keep the barrier on this call so
-        # the next layer's dispatch cannot race this slot's reset.
-        if _combine_overlap_enabled():
-            with torch.cuda.stream(torch.cuda.default_stream()):
+        if not bwd_overlap:
+            done.wait()
+            # Backward has no overlap to protect: keep the barrier on this call so
+            # the next layer's dispatch cannot race this slot's reset.
+            if _combine_overlap_enabled():
+                with torch.cuda.stream(torch.cuda.default_stream()):
+                    dist.barrier(group=resources.ep_group)
+            return result
+
+        # ★ MOONEP_BWD_COMBINE_OVERLAP: defer the wait to the layer's last
+        #   micro-batch. Waiting here would insert the dependency ahead of the
+        #   remaining micro-batch combines on the compute stream and serialise
+        #   exactly the work this switch exists to overlap. The layer barrier
+        #   moves here too: it must observe every combine of the layer.
+        gradients = state.layer_gradients
+        events = resources.bwd_slot_events
+        while len(events) <= state.grad_slot:
+            events.append(None)
+        events[state.grad_slot] = done
+        gradients.bwd_combine_done.append(done)
+        gradients.bwd_combine_pending -= 1
+        if gradients.bwd_combine_pending <= 0:
+            main = torch.cuda.current_stream()
+            for event in gradients.bwd_combine_done:
+                main.wait_event(event)
+            gradients.bwd_combine_done.clear()
+            default = torch.cuda.default_stream()
+            if main.npu_stream != default.npu_stream:
+                default.wait_stream(main)
+            with torch.cuda.stream(default):
                 dist.barrier(group=resources.ep_group)
     return result
 
@@ -1102,6 +1177,14 @@ def start_gradient_completion(state: _MoonEPLayerCallState, gradients: Projectio
     else:
         inputs = gradients  # type: ignore[assignment]
 
+    # ★ 2026-11-02 MOONEP_BWD_COMBINE_OVERLAP: pin the backward combine's
+    #   dependency here. This is the first host position after this call's
+    #   expert GEMM was submitted and before the next micro-batch's GEMM is
+    #   queued, so recording it now lets ``dispatch_backward`` start the combine
+    #   behind this call's dX alone.
+    if _bwd_combine_overlap_enabled():
+        state.grad_ready_event = torch.cuda.current_stream().record_event()
+
     with torch.profiler.record_function("MoonEP::gradient_handoff"):
         # The workspace owns the ``B`` split, the home-prefix zero-or-add, the
         # duplicate-suffix copy, and the EP exact-sum reduction. ``initialize``
@@ -1199,6 +1282,16 @@ class _MoonEPLayerGradJoin(torch.autograd.Function):
         # home. Publish every pair and let ``accumulate_fsdp_unsharded_expert_gradients``
         # sum them with ``add_``; publishing only the last would drop all but one
         # microbatch. With G=1 the loop runs once and behaviour is unchanged.
+        # ★ 2026-11-02 MOONEP_BWD_COMBINE_OVERLAP safety net: ``dispatch_backward``
+        #   normally drains every event at the layer's last micro-batch. If a
+        #   call never reaches that branch, still order the combines before the
+        #   layer hands its gradients back rather than leaving them in flight.
+        if _bwd_combine_overlap_enabled():
+            main = torch.cuda.current_stream()
+            for call_state in ctx.call_states:
+                pending = call_state.layer_gradients.bwd_combine_done
+                while pending:
+                    main.wait_event(pending.pop())
         for call_state in ctx.call_states:
             call_parameters, call_grads = finish_gradient_completion(call_state)
             accumulate_fsdp_unsharded_expert_gradients(call_parameters, call_grads)
@@ -1412,6 +1505,20 @@ class MoonEPDispatcher(
         resources = self._runtime.resources
         grad_slot = self._next_gradient_slot
         self._next_gradient_slot = (grad_slot + 1) % resources.gradient_slots
+        # ★ 2026-11-02 MOONEP_BWD_COMBINE_OVERLAP slot handover: the backward
+        #   combine of an earlier call keeps reading this slot on the comm stream
+        #   after the host returned. The ring is only ``intra_layer_micro_batch``
+        #   long, so the next layer's call can land on the same slot while that
+        #   read is still in flight -- a deterministic wrong-value read, not a
+        #   tolerance-level difference. Wait for the previous consumer here
+        #   instead of sizing a bigger ring: no extra device memory, one event
+        #   wait per reuse, and it fires only when the ring has actually wrapped.
+        slot_events = resources.bwd_slot_events
+        if _bwd_combine_overlap_enabled() and grad_slot < len(slot_events):
+            in_flight = slot_events[grad_slot]
+            if in_flight is not None:
+                torch.cuda.current_stream().wait_event(in_flight)
+                slot_events[grad_slot] = None
         # X8 is default-on for the Ascend MoonEP heap path (dW direct-to-heap).
         # ``XTUNER_MOE_X8=0`` reverts to the autograd-dW bridge path (A/B compare).
         # Gate on Ascend workspace: the ``grad_view`` accessor is Ascend-only.
@@ -1439,6 +1546,12 @@ class MoonEPDispatcher(
         call_states = tuple(self._new_call_state(gradients) for _ in layer_inputs)
         if len(call_states) > self._runtime.resources.gradient_slots:
             raise ValueError("MoonEP layer width exceeds the gradient slot ring")
+        # ★ 2026-11-02 MOONEP_BWD_COMBINE_OVERLAP: the last micro-batch of this
+        #   layer waits for every backward combine at once (see
+        #   ``dispatch_backward``). ``call_states`` is exactly this layer's
+        #   micro-batch count.
+        if _bwd_combine_overlap_enabled():
+            gradients.bwd_combine_pending = len(call_states)
         # No-grad original forwards build no backward node and never clear H.
         return list(_MoonEPLayerGradJoin.apply(call_states, *layer_inputs)), list(call_states)
 
