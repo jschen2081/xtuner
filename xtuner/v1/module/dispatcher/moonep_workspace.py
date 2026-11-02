@@ -138,8 +138,10 @@ class _MaskedZeroTail(torch.autograd.Function):
 
     Writing into ``src`` is safe here because ``prepare_experts`` runs strictly
     after ``dispatch_event.wait()``: no remote PUT can still be landing in this
-    buffer, so the zeroing cannot clobber an in-flight token.  Backward zeroes
-    the same tail in place for the same reason.
+    buffer, so the zeroing cannot clobber an in-flight token.  Backward clears
+    the same tail into a private tensor instead: the incoming ``grad`` is owned
+    by the autograd engine, which guarantees its value but not exclusive
+    ownership.
     """
 
     @staticmethod
@@ -154,10 +156,17 @@ class _MaskedZeroTail(torch.autograd.Function):
     def backward(ctx: Any, grad: torch.Tensor) -> tuple[torch.Tensor | None, None, None]:
         # Same tail as forward: ``dispatch_backward`` feeds this straight into
         # ``combine``, so the padding rows must not carry a GEMM gradient.
+        #
+        # The forward may write into ``src`` because it owns that buffer;
+        # ``grad`` is not ours.  The engine only guarantees the value, so a
+        # sibling branch (a residual, or a view onto the same storage) may still
+        # be reading it, and zeroing the tail in place would corrupt that
+        # branch.  Write the masked result into a private tensor.
         (covered,) = ctx.saved_tensors
         source = grad if grad.is_contiguous() else grad.contiguous()
-        moonep_ops.masked_copy(source, source, covered, ctx.nblk)
-        return source, None, None
+        out = torch.empty_like(source)
+        moonep_ops.masked_copy(out, source, covered, ctx.nblk)
+        return out, None, None
 
 
 # Shape legend used by every workspace structure below:

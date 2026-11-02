@@ -150,3 +150,20 @@ class TestComputeViewEquivalence(unittest.TestCase):
 
         assert torch.equal(copy_grad, inplace_grad)
         assert torch.count_nonzero(inplace_grad[self.covered :]) == 0
+
+    def test_inplace_backward_does_not_write_into_the_incoming_grad(self) -> None:
+        """``grad`` belongs to the engine; a sibling branch may still alias it."""
+        if moonep_workspace.moonep_ops is None:
+            self.skipTest("moonep_ops is not installed")
+        src, covered = self._source()
+        root = src.clone().requires_grad_(True)
+        out = _MaskedZeroTail.apply(root * 1.0, covered, 16)
+        grad = torch.randn(self.rows, self.hidden, dtype=torch.bfloat16, device="cuda")
+        reference = grad.clone()
+
+        (grad_in,) = torch.autograd.grad(out, root, grad)
+
+        assert torch.count_nonzero(grad_in[self.covered :]) == 0
+        assert torch.equal(grad_in[: self.covered], reference[: self.covered])
+        # The caller's buffer must come back untouched.
+        assert torch.equal(grad, reference)
